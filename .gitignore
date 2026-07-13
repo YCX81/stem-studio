@@ -1,0 +1,15 @@
+.venv/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+__pycache__/
+*.py[cod]
+data/models/*
+data/outputs/*
+data/temp/*
+data/live/*
+!data/models/.gitkeep
+!data/outputs/.gitkeep
+!data/temp/.gitkeep
+*.zip

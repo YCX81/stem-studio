@@ -1,0 +1,22 @@
+name: stem-studio
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: stem-studio:0.1.0
+    gpus: all
+    ports:
+      - "127.0.0.1:7860:7860"
+    volumes:
+      - ./data/models:/data/models
+      - ./data/outputs:/data/outputs
+      - ./data/temp:/data/temp
+      - ./data/live:/data/live
+    environment:
+      TMPDIR: /data/temp
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    restart: unless-stopped
+    init: true

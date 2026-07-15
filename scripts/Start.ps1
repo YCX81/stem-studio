@@ -7,6 +7,21 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
+$hostExe = Join-Path $root 'host\bin\stem-studio-audio-host.exe'
+if (-not (Test-Path -LiteralPath $hostExe)) {
+    throw '缺少 host\bin\stem-studio-audio-host.exe，请先构建原生音频宿主。'
+}
+$airplayExe = Join-Path $root 'airplay-host\bin\stem-studio-airplay-host.exe'
+if (-not (Test-Path -LiteralPath $airplayExe)) {
+    throw '缺少 airplay-host\bin\stem-studio-airplay-host.exe，请先运行 scripts\Build-AirPlayHost.ps1。'
+}
+$nativeRuntimeManifest = Join-Path $root 'native-runtime-manifest.json'
+if (Test-Path -LiteralPath $nativeRuntimeManifest -PathType Leaf) {
+    & (Join-Path $PSScriptRoot 'Verify-NativeRuntime.ps1') `
+        -Root $root `
+        -ManifestPath $nativeRuntimeManifest | Out-Null
+}
+
 if (Test-Path -LiteralPath 'data\live\controller-status.json') {
     try {
         $oldStatus = Get-Content -LiteralPath 'data\live\controller-status.json' -Raw | ConvertFrom-Json
@@ -23,14 +38,6 @@ foreach ($directory in @('data/models', 'data/outputs', 'data/temp', 'data/live/
     New-Item -ItemType Directory -Force -Path $directory | Out-Null
 }
 
-$hostExe = Join-Path $root 'host\bin\stem-studio-audio-host.exe'
-if (-not (Test-Path -LiteralPath $hostExe)) {
-    throw '缺少 host\bin\stem-studio-audio-host.exe，请先构建原生音频宿主。'
-}
-$airplayExe = Join-Path $root 'airplay-host\bin\stem-studio-airplay-host.exe'
-if (-not (Test-Path -LiteralPath $airplayExe)) {
-    throw '缺少 airplay-host\bin\stem-studio-airplay-host.exe，请先运行 scripts\Build-AirPlayHost.ps1。'
-}
 $controller = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $PSScriptRoot 'HostController.ps1'), '-Root', $root) -WindowStyle Hidden -PassThru
 $controller.Id | Set-Content -LiteralPath (Join-Path $root 'data\live\controller.pid') -Encoding ascii
 

@@ -51,6 +51,8 @@ try {
         -StagingRoot $stagingPath `
         -AllowedRoot $destinationPath
     $nativeRuntimeManifest = Get-MigrationNativeRuntimeManifest -Root $stagingPath
+    $nativeRuntimeManifest | ConvertTo-Json -Depth 3 |
+        Set-Content -LiteralPath (Join-Path $stagingPath 'native-runtime-manifest.json') -Encoding UTF8
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     [System.IO.Compression.ZipFile]::CreateFromDirectory(
         $stagingPath,

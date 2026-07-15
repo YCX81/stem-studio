@@ -68,3 +68,46 @@ function Get-MigrationNativeRuntimeManifest {
         airplay_package_sha256 = Get-DirectoryManifestHash -Root $airplayRoot
     }
 }
+
+function Test-MigrationNativeRuntimeManifest {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)]$NativeRuntimeManifest
+    )
+
+    try {
+        $actual = Get-MigrationNativeRuntimeManifest -Root $Root
+    } catch {
+        return [pscustomobject]@{
+            Valid = $false
+            Mismatches = @([pscustomobject]@{
+                component = 'runtime_layout'
+                expected = 'complete native runtime'
+                actual = $_.Exception.Message
+            })
+            Actual = $null
+        }
+    }
+
+    $mismatches = @()
+    foreach ($component in @(
+        'audio_host_sha256',
+        'airplay_host_sha256',
+        'airplay_package_sha256'
+    )) {
+        $expectedHash = [string]$NativeRuntimeManifest.$component
+        $actualHash = [string]$actual.$component
+        if (-not $expectedHash.Equals($actualHash, [StringComparison]::OrdinalIgnoreCase)) {
+            $mismatches += [pscustomobject]@{
+                component = $component
+                expected = $expectedHash
+                actual = $actualHash
+            }
+        }
+    }
+    return [pscustomobject]@{
+        Valid = ($mismatches.Count -eq 0)
+        Mismatches = @($mismatches)
+        Actual = $actual
+    }
+}

@@ -186,9 +186,12 @@ Windows 的进程环回捕获位于应用音量之后。本机验证表明：直
 在目标电脑解压 ZIP，安装并启动 Docker Desktop，然后运行：
 
 ```powershell
+.\scripts\Verify-NativeRuntime.ps1 -Root . -ManifestPath .\native-runtime-manifest.json
 .\scripts\Test-Gpu.ps1
 .\scripts\Start.ps1
 ```
+
+迁移 ZIP 内置的 `native-runtime-manifest.json` 会被 `Start.ps1` 自动复核；手工执行验证命令便于在启动前直接看到具体不匹配的 EXE 或完整 AirPlay/GStreamer 包。验证失败发生在停止任何现有宿主之前。
 
 ### 完全离线迁移
 

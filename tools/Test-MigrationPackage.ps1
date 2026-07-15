@@ -81,6 +81,38 @@ try {
     Assert-Equal (Get-DirectoryManifestHash -Root (Join-Path $runtimeRoot 'airplay-host')) `
         $runtimeManifest.airplay_package_sha256 'Complete AirPlay package manifest hash'
 
+    $validRuntime = Test-MigrationNativeRuntimeManifest `
+        -Root $runtimeRoot `
+        -NativeRuntimeManifest $runtimeManifest
+    Assert-Equal $true $validRuntime.Valid 'Matching native runtime must pass verification'
+    Assert-Equal 0 @($validRuntime.Mismatches).Count 'Matching runtime has no mismatch details'
+
+    [System.IO.File]::WriteAllBytes($runtimePlugin, [byte[]](21, 22, 23, 25))
+    $corruptRuntime = Test-MigrationNativeRuntimeManifest `
+        -Root $runtimeRoot `
+        -NativeRuntimeManifest $runtimeManifest
+    Assert-Equal $false $corruptRuntime.Valid 'A changed GStreamer DLL must fail runtime verification'
+    Assert-True ('airplay_package_sha256' -in @($corruptRuntime.Mismatches.component)) `
+        'Runtime verification must identify the complete AirPlay package mismatch'
+
+    $runtimeManifestPath = Join-Path $runtimeRoot 'migration-manifest.json'
+    [ordered]@{ native_runtime = $runtimeManifest } | ConvertTo-Json -Depth 4 |
+        Set-Content -LiteralPath $runtimeManifestPath -Encoding UTF8
+    $verifyRuntimeScript = Join-Path $workspace 'scripts\Verify-NativeRuntime.ps1'
+    $wrapperRejected = $false
+    try {
+        & $verifyRuntimeScript -Root $runtimeRoot -ManifestPath $runtimeManifestPath | Out-Null
+    } catch {
+        $wrapperRejected = $_.Exception.Message -like '*airplay_package_sha256*'
+    }
+    Assert-True $wrapperRejected 'Runtime verification command must reject and name a corrupt package'
+    [System.IO.File]::WriteAllBytes($runtimePlugin, [byte[]](21, 22, 23, 24))
+    & $verifyRuntimeScript -Root $runtimeRoot -ManifestPath $runtimeManifestPath | Out-Null
+    $directRuntimeManifestPath = Join-Path $runtimeRoot 'native-runtime-manifest.json'
+    $runtimeManifest | ConvertTo-Json -Depth 3 |
+        Set-Content -LiteralPath $directRuntimeManifestPath -Encoding UTF8
+    & $verifyRuntimeScript -Root $runtimeRoot -ManifestPath $directRuntimeManifestPath | Out-Null
+
     $sourceRoot = Join-Path $testRoot 'source'
     $exportRoot = Join-Path $testRoot 'export'
     $sourceFiles = @(
@@ -126,7 +158,8 @@ try {
         'tools/monitor_live_acceptance.py',
         'third_party/UxPlay/LICENSE',
         'host/bin/stem-studio-audio-host.exe',
-        'airplay-host/bin/stem-studio-airplay-host.exe'
+        'airplay-host/bin/stem-studio-airplay-host.exe',
+        'native-runtime-manifest.json'
     )) {
         Assert-True ($requiredEntry -in $entries) "Integrated export is missing: $requiredEntry"
     }

@@ -5,16 +5,20 @@ from pathlib import Path
 
 import gradio as gr
 
+from .acceptance_service import start_acceptance_service
 from .core import LIVE_PROFILES, MODEL_PROFILES, SeparationRequest
 from .engine import AudioSeparatorEngine, gpu_diagnostics
 from .live_worker import start_live_worker
 from .live_control import (
-    all_monitor_choices,
-    monitor_choices,
+    STEM_LABELS,
+    active_stem_visibility,
+    live_dashboard_html,
+    live_ui_defaults,
     read_processes,
     routing_markdown,
     status_markdown,
     write_command,
+    write_mixer_percentages,
 )
 
 
@@ -71,18 +75,130 @@ def refresh_live_processes():
     return gr.Dropdown(choices=choices, value=choices[0][1] if choices else None)
 
 
-def refresh_monitor_stems(profile_name: str):
-    choices = monitor_choices(profile_name)
-    return gr.Radio(choices=choices, value=choices[0][1])
+STEM_ORDER = tuple(STEM_LABELS)
 
 
-def start_live_capture(process_id: int | None, profile_name: str, monitor_stem: str) -> str:
+def _mixer_percentages(
+    vocals: float,
+    instrumental: float,
+    drums: float,
+    bass: float,
+    guitar: float,
+    piano: float,
+    other: float,
+) -> dict[str, float]:
+    return dict(
+        zip(
+            STEM_ORDER,
+            (vocals, instrumental, drums, bass, guitar, piano, other),
+            strict=True,
+        )
+    )
+
+
+def update_live_mix(
+    profile_name: str,
+    vocals: float,
+    instrumental: float,
+    drums: float,
+    bass: float,
+    guitar: float,
+    piano: float,
+    other: float,
+) -> str:
     try:
+        sequence = write_mixer_percentages(
+            LIVE_DIR,
+            profile_name,
+            _mixer_percentages(
+                vocals,
+                instrumental,
+                drums,
+                bass,
+                guitar,
+                piano,
+                other,
+            ),
+        )
+        return f"🟢 **混音已更新** · 控制序列 {sequence}"
+    except Exception as exc:
+        return f"🔴 **混音更新失败** · {exc}"
+
+
+def refresh_mixer_sliders(
+    profile_name: str,
+    vocals: float,
+    instrumental: float,
+    drums: float,
+    bass: float,
+    guitar: float,
+    piano: float,
+    other: float,
+):
+    values = _mixer_percentages(
+        vocals,
+        instrumental,
+        drums,
+        bass,
+        guitar,
+        piano,
+        other,
+    )
+    visibility = active_stem_visibility(profile_name)
+    status = update_live_mix(
+        profile_name,
+        vocals,
+        instrumental,
+        drums,
+        bass,
+        guitar,
+        piano,
+        other,
+    )
+    return tuple(
+        gr.Slider(value=values[stem], visible=visibility[stem]) for stem in STEM_ORDER
+    ) + (status,)
+
+
+def input_source_changed(input_source: str):
+    return gr.Dropdown(visible=input_source == "process")
+
+
+def refresh_live_dashboard() -> tuple[str, str]:
+    return status_markdown(LIVE_DIR), live_dashboard_html(LIVE_DIR)
+
+
+def start_live_capture(
+    input_source: str,
+    process_id: int | None,
+    profile_name: str,
+    vocals: float,
+    instrumental: float,
+    drums: float,
+    bass: float,
+    guitar: float,
+    piano: float,
+    other: float,
+) -> str:
+    try:
+        write_mixer_percentages(
+            LIVE_DIR,
+            profile_name,
+            _mixer_percentages(
+                vocals,
+                instrumental,
+                drums,
+                bass,
+                guitar,
+                piano,
+                other,
+            ),
+        )
         write_command(
             LIVE_DIR,
-            "start",
-            process_id,
-            monitor_stem=monitor_stem,
+            "start_airplay" if input_source == "airplay" else "start",
+            None if input_source == "airplay" else process_id,
+            monitor_stem=LIVE_PROFILES[profile_name].stems[0],
             profile_name=profile_name,
         )
         latency = {
@@ -90,6 +206,11 @@ def start_live_capture(process_id: int | None, profile_name: str, monitor_stem: 
             "四轨 · 人声/鼓/贝斯/其他": "约 22–26 秒",
             "六轨 · 加吉他/钢琴": "约 16–20 秒",
         }[profile_name]
+        if input_source == "airplay":
+            return (
+                "🟡 **正在启动内置 AirPlay 接收器** · 在手机控制中心选择 Stem Studio · "
+                f"首个 AI 结果{latency}"
+            )
         return f"🟡 **正在启动 {profile_name}** · 首个 AI 结果{latency}"
     except Exception as exc:
         return f"🔴 **启动失败** · {exc}"
@@ -109,6 +230,10 @@ def open_audio_settings() -> str:
 
 
 def build_app() -> gr.Blocks:
+    initial_live = live_ui_defaults(LIVE_DIR)
+    initial_source = initial_live["input_source"]
+    initial_profile = initial_live["profile_name"]
+    initial_gains = initial_live["gains"]
     with gr.Blocks(title="Stem Studio") as app:
         gr.HTML(
             "<div class='hero'><h1>Stem Studio</h1>"
@@ -118,41 +243,107 @@ def build_app() -> gr.Blocks:
         with gr.Tabs():
             with gr.Tab("实时分离"):
                 gr.Markdown(
-                    "自动捕获所选 Windows 音乐软件及其子进程。"
-                    "可实时切换二轨、四轨或六轨模型，均按 12 秒连续窗口工作。"
+                    "可捕获所选 Windows 音乐软件，也可由内置 UxPlay 1.74 宿主接收手机 AirPlay，解码 PCM 后直接分离。"
+                    "支持二轨、四轨或六轨实时输出模式；采用 12 秒分析窗、6 秒步进和 100ms 同时间轴交叉拼接。"
+                )
+                input_source = gr.Radio(
+                    choices=[
+                        ("Windows 音乐软件", "process"),
+                        ("手机 AirPlay → 内置接收器", "airplay"),
+                    ],
+                    value=initial_source,
+                    label="音频来源",
                 )
                 with gr.Row():
-                    live_process = gr.Dropdown(label="正在运行的音乐软件", choices=[])
+                    live_process = gr.Dropdown(
+                        label="正在运行的音乐软件",
+                        choices=[],
+                        visible=initial_source == "process",
+                    )
                     refresh_processes = gr.Button("刷新软件列表")
                 live_profile = gr.Dropdown(
-                    choices=list(LIVE_PROFILES),
-                    value="人声 / 伴奏 · 高质量",
+                    choices=[
+                        (profile.display_name, profile_name)
+                        for profile_name, profile in LIVE_PROFILES.items()
+                    ],
+                    value=initial_profile,
                     label="实时分离模式",
                 )
-                monitor_stem = gr.Radio(
-                    choices=all_monitor_choices(),
-                    value="instrumental",
-                    label="监听音轨",
-                )
+                gr.Markdown("#### 实时多轨混音\n拖动任一滑杆会在不中断声卡输出的情况下平滑更新混音。")
+                initial_visibility = active_stem_visibility(initial_profile)
+                mixer_sliders = []
+                with gr.Row():
+                    for stem in STEM_ORDER[:4]:
+                        mixer_sliders.append(
+                            gr.Slider(
+                                minimum=0,
+                                maximum=100,
+                                value=round(initial_gains[stem] * 100),
+                                step=1,
+                                label=f"{STEM_LABELS[stem]}音量 (%)",
+                                visible=initial_visibility[stem],
+                            )
+                        )
+                with gr.Row():
+                    for stem in STEM_ORDER[4:]:
+                        mixer_sliders.append(
+                            gr.Slider(
+                                minimum=0,
+                                maximum=100,
+                                value=round(initial_gains[stem] * 100),
+                                step=1,
+                                label=f"{STEM_LABELS[stem]}音量 (%)",
+                                visible=initial_visibility[stem],
+                            )
+                        )
+                mixer_status = gr.Markdown("🟢 **已恢复当前混音器状态**")
                 with gr.Row():
                     start_live = gr.Button("开始实时捕获", variant="primary")
                     stop_live = gr.Button("停止", variant="stop")
                     refresh_status = gr.Button("刷新状态")
                 live_status = gr.Markdown(status_markdown(LIVE_DIR))
+                live_visualizer = gr.HTML(live_dashboard_html(LIVE_DIR))
                 routing_status = gr.Markdown(routing_markdown(LIVE_DIR))
+                gr.Markdown(
+                    "AirPlay 接收器随实时会话自动启动。音乐投送通常为 ALAC；"
+                    "屏幕镜像音频通常为 AAC-ELD，不属于无损链路。"
+                )
                 with gr.Row():
                     open_routing = gr.Button("打开 Windows 音量混合器")
                     refresh_routing = gr.Button("刷新纯净监听检测")
                 refresh_processes.click(refresh_live_processes, outputs=live_process)
-                live_profile.change(refresh_monitor_stems, inputs=live_profile, outputs=monitor_stem)
-                app.load(refresh_monitor_stems, inputs=live_profile, outputs=monitor_stem)
+                input_source.change(input_source_changed, inputs=input_source, outputs=live_process)
+                mixer_inputs = [live_profile, *mixer_sliders]
+                mixer_outputs = [*mixer_sliders, mixer_status]
+                live_profile.change(
+                    refresh_mixer_sliders,
+                    inputs=mixer_inputs,
+                    outputs=mixer_outputs,
+                    queue=False,
+                )
+                app.load(
+                    refresh_mixer_sliders,
+                    inputs=mixer_inputs,
+                    outputs=mixer_outputs,
+                    queue=False,
+                )
+                for slider in mixer_sliders:
+                    slider.input(
+                        update_live_mix,
+                        inputs=mixer_inputs,
+                        outputs=mixer_status,
+                        queue=False,
+                        trigger_mode="always_last",
+                    )
                 start_live.click(
                     start_live_capture,
-                    inputs=[live_process, live_profile, monitor_stem],
+                    inputs=[input_source, live_process, live_profile, *mixer_sliders],
                     outputs=live_status,
                 )
                 stop_live.click(stop_live_capture, outputs=live_status)
-                refresh_status.click(lambda: status_markdown(LIVE_DIR), outputs=live_status)
+                refresh_status.click(refresh_live_dashboard, outputs=[live_status, live_visualizer])
+                live_timer = gr.Timer(0.5)
+                live_timer.tick(refresh_live_dashboard, outputs=[live_status, live_visualizer])
                 open_routing.click(open_audio_settings, outputs=routing_status)
                 refresh_routing.click(lambda: routing_markdown(LIVE_DIR), outputs=routing_status)
             with gr.Tab("文件分离"):
@@ -193,6 +384,7 @@ def build_app() -> gr.Blocks:
 def main() -> None:
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    start_acceptance_service(DATA_ROOT / "live")
     start_live_worker(DATA_ROOT / "live")
     app = build_app()
     app.queue(default_concurrency_limit=1).launch(

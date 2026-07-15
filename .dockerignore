@@ -6,5 +6,9 @@ htmlcov
 data
 tests
 scripts
+host
+airplay-host
+third_party
+tools
 __pycache__
 *.pyc

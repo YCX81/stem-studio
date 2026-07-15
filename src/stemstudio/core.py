@@ -16,25 +16,57 @@ MODEL_PROFILES = {
 @dataclass(frozen=True)
 class LiveProfile:
     name: str
+    display_name: str
     model_filename: str
     stems: tuple[str, ...]
+    source_groups: tuple[tuple[str, ...], ...]
+
+    def __post_init__(self) -> None:
+        if not self.stems or len(self.stems) != len(self.source_groups):
+            raise ValueError("实时输出音轨与模型源分组不一致。")
+        if len(set(self.stems)) != len(self.stems) or any(not group for group in self.source_groups):
+            raise ValueError("实时音轨分组不能为空或重复。")
+        flattened = tuple(source for group in self.source_groups for source in group)
+        if len(flattened) != len(set(flattened)):
+            raise ValueError("同一模型源音轨不能重复汇入多个实时音轨。")
 
 
 LIVE_PROFILES = {
     "人声 / 伴奏 · 高质量": LiveProfile(
         name="人声 / 伴奏 · 高质量",
-        model_filename=MODEL_PROFILES["人声 / 伴奏 · 高质量"],
+        display_name="二轨 · 实时人声/伴奏",
+        model_filename=MODEL_PROFILES["六轨 · 加吉他/钢琴"],
         stems=("vocals", "instrumental"),
+        source_groups=(
+            ("vocals",),
+            ("drums", "bass", "guitar", "piano", "other"),
+        ),
     ),
     "四轨 · 人声/鼓/贝斯/其他": LiveProfile(
         name="四轨 · 人声/鼓/贝斯/其他",
-        model_filename=MODEL_PROFILES["四轨 · 人声/鼓/贝斯/其他"],
+        display_name="四轨 · 实时人声/鼓/贝斯/其他",
+        model_filename=MODEL_PROFILES["六轨 · 加吉他/钢琴"],
         stems=("vocals", "drums", "bass", "other"),
+        source_groups=(
+            ("vocals",),
+            ("drums",),
+            ("bass",),
+            ("guitar", "piano", "other"),
+        ),
     ),
     "六轨 · 加吉他/钢琴": LiveProfile(
         name="六轨 · 加吉他/钢琴",
+        display_name="六轨 · 实时完整分轨",
         model_filename=MODEL_PROFILES["六轨 · 加吉他/钢琴"],
         stems=("vocals", "drums", "bass", "guitar", "piano", "other"),
+        source_groups=(
+            ("vocals",),
+            ("drums",),
+            ("bass",),
+            ("guitar",),
+            ("piano",),
+            ("other",),
+        ),
     ),
 }
 

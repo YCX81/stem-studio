@@ -1,5 +1,6 @@
 ﻿param(
-    [switch]$NoBuild
+    [switch]$NoBuild,
+    [switch]$NoBrowser
 )
 
 $ErrorActionPreference = 'Stop'
@@ -10,6 +11,7 @@ if (Test-Path -LiteralPath 'data\live\controller-status.json') {
     try {
         $oldStatus = Get-Content -LiteralPath 'data\live\controller-status.json' -Raw | ConvertFrom-Json
         if ($oldStatus.host_pid) { Stop-Process -Id ([int]$oldStatus.host_pid) -Force -ErrorAction SilentlyContinue }
+        if ($oldStatus.airplay_pid) { Stop-Process -Id ([int]$oldStatus.airplay_pid) -Force -ErrorAction SilentlyContinue }
     } catch { }
 }
 if (Test-Path -LiteralPath 'data\live\controller.pid') {
@@ -24,6 +26,10 @@ foreach ($directory in @('data/models', 'data/outputs', 'data/temp', 'data/live/
 $hostExe = Join-Path $root 'host\bin\stem-studio-audio-host.exe'
 if (-not (Test-Path -LiteralPath $hostExe)) {
     throw '缺少 host\bin\stem-studio-audio-host.exe，请先构建原生音频宿主。'
+}
+$airplayExe = Join-Path $root 'airplay-host\bin\stem-studio-airplay-host.exe'
+if (-not (Test-Path -LiteralPath $airplayExe)) {
+    throw '缺少 airplay-host\bin\stem-studio-airplay-host.exe，请先运行 scripts\Build-AirPlayHost.ps1。'
 }
 $controller = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $PSScriptRoot 'HostController.ps1'), '-Root', $root) -WindowStyle Hidden -PassThru
 $controller.Id | Set-Content -LiteralPath (Join-Path $root 'data\live\controller.pid') -Encoding ascii
@@ -48,7 +54,7 @@ for ($attempt = 1; $attempt -le 60; $attempt++) {
     try {
         $response = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:7860/' -TimeoutSec 2
         if ($response.StatusCode -eq 200) {
-            Start-Process 'http://127.0.0.1:7860/'
+            if (-not $NoBrowser) { Start-Process 'http://127.0.0.1:7860/' }
             Write-Host 'Stem Studio 已启动：http://127.0.0.1:7860/' -ForegroundColor Green
             exit 0
         }

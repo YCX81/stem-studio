@@ -13,7 +13,7 @@ $archivePath = Join-Path $destinationPath $archiveName
 New-Item -ItemType Directory -Force -Path $destinationPath | Out-Null
 
 $items = @(
-    'src', 'scripts', 'host/bin', 'Dockerfile', 'compose.yaml', 'pyproject.toml',
+    'src', 'scripts', 'host', 'airplay-host', 'third_party/UxPlay', 'Dockerfile', 'compose.yaml', 'pyproject.toml',
     'README.md', '.dockerignore', '.gitignore'
 )
 if ($IncludeModels) {
@@ -42,7 +42,9 @@ try {
         }
     }
     Get-ChildItem -LiteralPath $stagingPath -Directory -Recurse -Filter '__pycache__' | Remove-Item -Recurse -Force
-    Get-ChildItem -LiteralPath $stagingPath -File -Recurse -Include '*.pyc','*.pyo' | Remove-Item -Force
+    Get-ChildItem -LiteralPath $stagingPath -File -Recurse |
+        Where-Object { $_.Extension -in @('.pyc', '.pyo') } |
+        Remove-Item -Force
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     [System.IO.Compression.ZipFile]::CreateFromDirectory(
         $stagingPath,

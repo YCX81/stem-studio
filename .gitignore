@@ -13,3 +13,5 @@ data/live/*
 !data/outputs/.gitkeep
 !data/temp/.gitkeep
 *.zip
+airplay-host/
+host/bin/*.next.exe

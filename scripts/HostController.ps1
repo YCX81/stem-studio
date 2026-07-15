@@ -1,11 +1,26 @@
 ﻿param([Parameter(Mandatory = $true)][string]$Root)
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'HostController.Core.ps1')
+# Windows PowerShell Start-Process rejects environment blocks that contain both
+# PATH and Path (some launchers create this duplicate). Normalize it once here.
+$processPath = $env:PATH
+[Environment]::SetEnvironmentVariable('PATH', $null, 'Process')
+[Environment]::SetEnvironmentVariable('Path', $processPath, 'Process')
 $rootPath = [System.IO.Path]::GetFullPath($Root)
 $live = Join-Path $rootPath 'data\live'
 $hostExe = Join-Path $rootPath 'host\bin\stem-studio-audio-host.exe'
+$airplayBin = Join-Path $rootPath 'airplay-host\bin'
+$airplayExe = Join-Path $airplayBin 'stem-studio-airplay-host.exe'
+$gstPlugins = 'airplay-host\lib\gstreamer-1.0'
+$gstScanner = 'airplay-host\libexec\gstreamer-1.0\gst-plugin-scanner.exe'
 $lastCommand = 0L
 $captureProcess = $null
+$airplayProcess = $null
+$playbackPriority = $null
+$airplayPriority = $null
+$activeProfileName = ''
+$activeLanInterface = $null
 $audioScanCountdown = 0
 
 function Write-AtomicJson([string]$Path, $Value) {
@@ -14,12 +29,31 @@ function Write-AtomicJson([string]$Path, $Value) {
     Move-Item -LiteralPath $partial -Destination $Path -Force
 }
 
-function Stop-Capture {
+function Stop-Playback {
     if ($null -ne $script:captureProcess -and -not $script:captureProcess.HasExited) {
         Stop-Process -Id $script:captureProcess.Id -Force
         $script:captureProcess.WaitForExit(3000) | Out-Null
     }
     $script:captureProcess = $null
+    $script:playbackPriority = $null
+    $script:activeProfileName = ''
+}
+
+function Stop-AirPlayReceiver {
+    if ($null -ne $script:airplayProcess -and -not $script:airplayProcess.HasExited) {
+        Stop-Process -Id $script:airplayProcess.Id -Force
+        $script:airplayProcess.WaitForExit(3000) | Out-Null
+    }
+    $script:airplayProcess = $null
+    $script:airplayPriority = $null
+    $script:activeLanInterface = $null
+    Remove-Item -LiteralPath (Join-Path $live 'airplay-status.json') -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath (Join-Path $live 'airplay-status.json.part') -Force -ErrorAction SilentlyContinue
+}
+
+function Stop-Capture {
+    Stop-Playback
+    Stop-AirPlayReceiver
 }
 
 function Update-AudioRouting {
@@ -42,12 +76,50 @@ function Update-AudioRouting {
     }
 }
 
+function Get-AirPlayLanInterface {
+    try {
+        $adapters = @(Get-NetAdapter -IncludeHidden -ErrorAction Stop | Where-Object {
+            $_.HardwareInterface -and $_.Status -eq 'Up'
+        })
+        $interfaces = @(Get-NetIPInterface -AddressFamily IPv4 -ErrorAction Stop | Where-Object {
+            $_.ConnectionState -eq 'Connected'
+        })
+        $addresses = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | Where-Object {
+            $_.IPAddress -notmatch '^(127\.|169\.254\.|0\.)'
+        })
+
+        $candidates = foreach ($adapter in $adapters) {
+            $interface = $interfaces | Where-Object InterfaceIndex -eq $adapter.InterfaceIndex | Select-Object -First 1
+            if ($null -eq $interface) { continue }
+            foreach ($address in ($addresses | Where-Object InterfaceIndex -eq $adapter.InterfaceIndex)) {
+                [pscustomobject]@{
+                    IPv4 = [string]$address.IPAddress
+                    Name = [string]$adapter.Name
+                    Mac = ([string]$adapter.MacAddress).Replace('-', ':').ToLowerInvariant()
+                    Metric = [int]$interface.InterfaceMetric
+                }
+            }
+        }
+
+        return $candidates | Sort-Object Metric, Name | Select-Object -First 1
+    } catch {
+        return $null
+    }
+}
+
 New-Item -ItemType Directory -Force -Path $live | Out-Null
 if (-not (Test-Path -LiteralPath $hostExe)) { throw "缺少原生音频宿主：$hostExe" }
+$env:Path = "airplay-host\bin;$env:Path"
+$env:GST_PLUGIN_SYSTEM_PATH_1_0 = $gstPlugins
+$env:GST_PLUGIN_PATH_1_0 = ''
+$env:GST_PLUGIN_SCANNER = $gstScanner
+$env:GST_PLUGIN_SCANNER_1_0 = $gstScanner
+$env:GST_REGISTRY_1_0 = 'data\live\gstreamer-registry.bin'
+$env:GST_REGISTRY_FORK = 'no'
 $existingCommandPath = Join-Path $live 'command.json'
 if (Test-Path -LiteralPath $existingCommandPath) {
     try {
-        $existingCommand = Get-Content -LiteralPath $existingCommandPath -Raw | ConvertFrom-Json
+        $existingCommand = Get-Content -LiteralPath $existingCommandPath -Raw -Encoding UTF8 | ConvertFrom-Json
         $lastCommand = [long]$existingCommand.sequence
     } catch {
         $lastCommand = 0L
@@ -74,23 +146,62 @@ try {
         $commandPath = Join-Path $live 'command.json'
         if (Test-Path -LiteralPath $commandPath) {
             try {
-                $command = Get-Content -LiteralPath $commandPath -Raw | ConvertFrom-Json
+                $command = Get-Content -LiteralPath $commandPath -Raw -Encoding UTF8 | ConvertFrom-Json
                 if ([long]$command.sequence -gt $lastCommand) {
                     $lastCommand = [long]$command.sequence
                     if ($command.action -eq 'open_audio_settings') {
                         Start-Process 'ms-settings:apps-volume'
                         Write-AtomicJson (Join-Path $live 'routing-action.json') ([ordered]@{ state='opened'; opened_at=[DateTime]::UtcNow.ToString('o') })
+                    } elseif ($command.action -eq 'start_airplay') {
+                        if (-not (Test-Path -LiteralPath $airplayExe)) { throw "缺少内置 AirPlay 宿主：$airplayExe" }
+                        $profileName = [string]$command.profile_name
+                        $trackCount = Assert-LiveTrackCount ([int]$command.track_count)
+                        $airplayRunning = $null -ne $airplayProcess -and -not $airplayProcess.HasExited
+                        $playbackRunning = $null -ne $captureProcess -and -not $captureProcess.HasExited
+                        $startPlan = Get-AirPlayStartPlan -AirPlayRunning $airplayRunning -PlaybackRunning $playbackRunning -CurrentProfile $activeProfileName -RequestedProfile $profileName
+                        if ($startPlan.RestartAirPlay) {
+                            Stop-Capture
+                        } elseif ($startPlan.RestartPlayback) {
+                            Stop-Playback
+                        }
+                        $stdout = Join-Path $live 'playback-stdout.log'
+                        $stderr = Join-Path $live 'playback-stderr.log'
+                        if ($startPlan.RestartPlayback) {
+                            $captureProcess = Start-Process -FilePath $hostExe -ArgumentList @('--playback-only', 'data\live', $trackCount) -WorkingDirectory $rootPath -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+                            $playbackPriority = Set-StreamingProcessPriority $captureProcess
+                            $activeProfileName = $profileName
+                        }
+                        $airplayStdout = Join-Path $live 'airplay-stdout.log'
+                        $airplayStderr = Join-Path $live 'airplay-stderr.log'
+                        if ($startPlan.RestartAirPlay) {
+                            $activeLanInterface = Get-AirPlayLanInterface
+                            $airplayArgs = @('-n', 'StemStudio', '-nh', '-vs', '0', '-stem-live-dir', 'data/live')
+                            if ($null -ne $activeLanInterface) {
+                                $env:STEM_STUDIO_MDNS_IPV4 = $activeLanInterface.IPv4
+                                if ($activeLanInterface.Mac) { $airplayArgs += @('-m', $activeLanInterface.Mac) }
+                            } else {
+                                Remove-Item Env:STEM_STUDIO_MDNS_IPV4 -ErrorAction SilentlyContinue
+                            }
+                            try {
+                                $airplayProcess = Start-Process -FilePath $airplayExe -ArgumentList $airplayArgs -WorkingDirectory $rootPath -WindowStyle Hidden -RedirectStandardOutput $airplayStdout -RedirectStandardError $airplayStderr -PassThru
+                                $airplayPriority = Set-StreamingProcessPriority $airplayProcess
+                            } catch {
+                                Stop-Capture
+                                throw
+                            }
+                        }
+                        Write-AtomicJson (Join-Path $live 'controller-status.json') ([ordered]@{ state='airplay_waiting'; input_source='airplay'; monitor_stem='mix'; profile_name=$profileName; track_count=$trackCount; host_pid=$captureProcess.Id; airplay_pid=$airplayProcess.Id; playback_priority=$playbackPriority; airplay_priority=$airplayPriority; lan_interface=$(if ($null -ne $activeLanInterface) { $activeLanInterface.Name } else { $null }); lan_ipv4=$(if ($null -ne $activeLanInterface) { $activeLanInterface.IPv4 } else { $null }); connection_reused=(-not $startPlan.RestartAirPlay) })
                     } elseif ($command.action -eq 'start') {
                         Stop-Capture
                         $target = Get-Process -Id ([int]$command.process_id) -ErrorAction Stop
                         $stdout = Join-Path $live 'capture-stdout.log'
                         $stderr = Join-Path $live 'capture-stderr.log'
-                        $allowedStems = @('instrumental', 'vocals', 'drums', 'bass', 'other', 'guitar', 'piano')
-                        $stem = [string]$command.monitor_stem
-                        if ($allowedStems -notcontains $stem) { throw "不支持的监听音轨：$stem" }
                         $profileName = [string]$command.profile_name
-                        $captureProcess = Start-Process -FilePath $hostExe -ArgumentList @($target.Id, $live, $stem) -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
-                        Write-AtomicJson (Join-Path $live 'controller-status.json') ([ordered]@{ state='capturing'; process_id=$target.Id; process_name=$target.ProcessName; monitor_stem=$stem; profile_name=$profileName; host_pid=$captureProcess.Id })
+                        $trackCount = Assert-LiveTrackCount ([int]$command.track_count)
+                        $captureProcess = Start-Process -FilePath $hostExe -ArgumentList @($target.Id, 'data\live', $trackCount) -WorkingDirectory $rootPath -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+                        $playbackPriority = Set-StreamingProcessPriority $captureProcess
+                        $activeProfileName = $profileName
+                        Write-AtomicJson (Join-Path $live 'controller-status.json') ([ordered]@{ state='capturing'; process_id=$target.Id; process_name=$target.ProcessName; monitor_stem='mix'; profile_name=$profileName; track_count=$trackCount; host_pid=$captureProcess.Id; playback_priority=$playbackPriority })
                     } elseif ($command.action -eq 'stop') {
                         Stop-Capture
                         Write-AtomicJson (Join-Path $live 'controller-status.json') ([ordered]@{ state='stopped' })
@@ -103,8 +214,14 @@ try {
             }
         }
         if ($null -ne $captureProcess -and $captureProcess.HasExited) {
-            Write-AtomicJson (Join-Path $live 'controller-status.json') ([ordered]@{ state='error'; error="音频宿主已退出，退出码 $($captureProcess.ExitCode)" })
-            $captureProcess = $null
+            $exitCode = $captureProcess.ExitCode
+            Stop-Playback
+            Write-AtomicJson (Join-Path $live 'controller-status.json') ([ordered]@{ state='error'; error="音频播放宿主已退出，退出码 $exitCode；AirPlay 接收器保持运行"; airplay_pid=$(if ($null -ne $airplayProcess -and -not $airplayProcess.HasExited) { $airplayProcess.Id } else { $null }) })
+        }
+        if ($null -ne $airplayProcess -and $airplayProcess.HasExited) {
+            $exitCode = $airplayProcess.ExitCode
+            Stop-Capture
+            Write-AtomicJson (Join-Path $live 'controller-status.json') ([ordered]@{ state='error'; error="AirPlay 宿主已退出，退出码 $exitCode" })
         }
         Start-Sleep -Seconds 2
     }

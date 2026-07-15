@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from stemstudio.core import LIVE_PROFILES
 from stemstudio.live import (
     InvalidLiveTransition,
     LiveChunkProcessor,
@@ -25,16 +26,38 @@ def _write_pcm16_stereo(path: Path, frames: int, sample_rate: int = 44_100) -> N
         audio.writeframes((left + right) * frames)
 
 
+def _write_constant_pcm16_stereo(
+    path: Path,
+    frames: int,
+    value: int,
+    sample_rate: int,
+) -> None:
+    sample = value.to_bytes(2, "little", signed=True)
+    with wave.open(str(path), "wb") as audio:
+        audio.setnchannels(2)
+        audio.setsampwidth(2)
+        audio.setframerate(sample_rate)
+        audio.writeframes((sample + sample) * frames)
+
+
+def _first_pcm16_sample(path: Path) -> int:
+    with wave.open(str(path), "rb") as audio:
+        return int.from_bytes(audio.readframes(1)[:2], "little", signed=True)
+
+
 def test_live_config_defaults_match_high_quality_streaming_contract() -> None:
     config = LiveConfig()
 
     assert config.sample_rate == 44_100
     assert config.channels == 2
     assert config.window_seconds == 12
-    assert config.hop_seconds == 12
+    assert config.hop_seconds == 6
     assert config.stable_offset_seconds == 0
+    assert config.crossfade_milliseconds == 100
     assert config.window_frames == 529_200
-    assert config.hop_frames == 529_200
+    assert config.hop_frames == 264_600
+    assert config.overlap_frames == 4_410
+    assert config.output_frames == 269_010
 
 
 @pytest.mark.parametrize(
@@ -46,6 +69,8 @@ def test_live_config_defaults_match_high_quality_streaming_contract() -> None:
         ({"hop_seconds": 0}, "步长"),
         ({"hop_seconds": 5}, "整除"),
         ({"stable_offset_seconds": 11}, "稳定区间"),
+        ({"crossfade_milliseconds": 0}, "交叉淡化"),
+        ({"crossfade_milliseconds": 7_000}, "交叉淡化"),
     ],
 )
 def test_live_config_rejects_invalid_stream_geometry(kwargs: dict, message: str) -> None:
@@ -187,6 +212,59 @@ def test_persistent_separator_configures_single_shift_demucs_for_live(tmp_path: 
     assert captured["demucs_params"]["overlap"] == 0.25
 
 
+def test_persistent_separator_keeps_demucs_network_resident_between_windows(
+    tmp_path: Path,
+) -> None:
+    architecture = object()
+    runtime_instances = []
+    fallback_calls = []
+
+    class FakeSeparator:
+        def __init__(self, **_kwargs):
+            self.model_instance = None
+
+        def load_model(self, model_filename: str) -> None:
+            assert model_filename == "htdemucs_6s.yaml"
+            self.model_instance = architecture
+
+        def separate(self, source: str) -> list[str]:
+            fallback_calls.append(source)
+            return []
+
+    class FakeResidentDemucsRuntime:
+        def __init__(self, model_architecture) -> None:
+            assert model_architecture is architecture
+            self.calls = []
+            self.closed = False
+            runtime_instances.append(self)
+
+        def separate(self, source: Path) -> list[Path]:
+            self.calls.append(source.name)
+            return [Path("Vocals.wav"), Path("Other.wav")]
+
+        def close(self) -> None:
+            self.closed = True
+
+    separator = PersistentSeparator(
+        model_dir=tmp_path / "models",
+        work_dir=tmp_path / "work",
+        model_filename="htdemucs_6s.yaml",
+        separator_factory=FakeSeparator,
+        resident_demucs_factory=FakeResidentDemucsRuntime,
+    )
+
+    first = separator.separate(tmp_path / "one.wav")
+    second = separator.separate(tmp_path / "two.wav")
+    separator.close()
+
+    assert len(runtime_instances) == 1
+    assert runtime_instances[0].calls == ["one.wav", "two.wav"]
+    assert runtime_instances[0].closed is True
+    assert fallback_calls == []
+    assert [path.name for path in first] == ["Vocals.wav", "Other.wav"]
+    assert [path.name for path in second] == ["Vocals.wav", "Other.wav"]
+
+
 def test_live_chunk_processor_extracts_stable_hop_and_publishes_manifest_last(
     tmp_path: Path,
 ) -> None:
@@ -215,12 +293,16 @@ def test_live_chunk_processor_extracts_stable_hop_and_publishes_manifest_last(
     assert result.manifest.name == "result-00000001.json"
     manifest = json.loads(result.manifest.read_text(encoding="utf-8"))
     assert manifest["sequence"] == 1
+    assert manifest["version"] == 2
+    assert manifest["hop_seconds"] == config.hop_seconds
+    assert manifest["overlap_frames"] == config.overlap_frames
+    assert manifest["cache_hit"] is False
     assert set(manifest["stems"]) == {"vocals", "instrumental"}
     for filename in manifest["stems"].values():
         output = outbox / filename
         assert output.exists()
         with wave.open(str(output), "rb") as audio:
-            assert audio.getnframes() == config.hop_frames
+            assert audio.getnframes() == config.output_frames
             assert audio.getframerate() == config.sample_rate
             assert audio.getnchannels() == 2
     assert not list(outbox.glob("*.part"))
@@ -271,3 +353,94 @@ def test_live_chunk_processor_publishes_all_six_requested_stems(tmp_path: Path) 
     manifest = json.loads(result.manifest.read_text(encoding="utf-8"))
     assert tuple(manifest["stems"]) == expected
     assert all((tmp_path / "out" / filename).is_file() for filename in manifest["stems"].values())
+
+
+@pytest.mark.parametrize(
+    ("profile_name", "expected_samples"),
+    [
+        ("人声 / 伴奏 · 高质量", {"vocals": 1_000, "instrumental": 20_000}),
+        (
+            "四轨 · 人声/鼓/贝斯/其他",
+            {"vocals": 1_000, "drums": 2_000, "bass": 3_000, "other": 15_000},
+        ),
+    ],
+)
+def test_live_chunk_processor_composes_fast_six_source_model_into_requested_tracks(
+    tmp_path: Path,
+    profile_name: str,
+    expected_samples: dict[str, int],
+) -> None:
+    profile = LIVE_PROFILES[profile_name]
+    config = LiveConfig(sample_rate=10, window_seconds=8, hop_seconds=2, stable_offset_seconds=3)
+    source = tmp_path / "capture-00000001.wav"
+    _write_pcm16_stereo(source, config.window_frames, config.sample_rate)
+    source_values = {
+        "vocals": 1_000,
+        "drums": 2_000,
+        "bass": 3_000,
+        "guitar": 4_000,
+        "piano": 5_000,
+        "other": 6_000,
+    }
+
+    class SixStemEngine:
+        def separate(self, _source: Path) -> list[Path]:
+            outputs = []
+            for stem, value in source_values.items():
+                path = tmp_path / f"track_({stem.title()}).wav"
+                _write_constant_pcm16_stereo(
+                    path,
+                    config.window_frames,
+                    value,
+                    config.sample_rate,
+                )
+                outputs.append(path)
+            return outputs
+
+    result = LiveChunkProcessor(
+        config,
+        tmp_path / "out",
+        SixStemEngine(),
+        expected_stems=profile.stems,
+        stem_sources=dict(zip(profile.stems, profile.source_groups, strict=True)),
+    ).process(discover_ready_chunks(tmp_path)[0])
+
+    manifest = json.loads(result.manifest.read_text(encoding="utf-8"))
+    actual = {
+        stem: _first_pcm16_sample(tmp_path / "out" / filename)
+        for stem, filename in manifest["stems"].items()
+    }
+    assert actual == expected_samples
+
+
+def test_live_chunk_processor_saturates_composed_track_without_wrapping(tmp_path: Path) -> None:
+    profile = LIVE_PROFILES["人声 / 伴奏 · 高质量"]
+    config = LiveConfig(sample_rate=10, window_seconds=8, hop_seconds=2, stable_offset_seconds=3)
+    source = tmp_path / "capture-00000001.wav"
+    _write_pcm16_stereo(source, config.window_frames, config.sample_rate)
+
+    class LoudSixStemEngine:
+        def separate(self, _source: Path) -> list[Path]:
+            outputs = []
+            for stem in ("vocals", "drums", "bass", "guitar", "piano", "other"):
+                path = tmp_path / f"track_({stem.title()}).wav"
+                _write_constant_pcm16_stereo(
+                    path,
+                    config.window_frames,
+                    10_000,
+                    config.sample_rate,
+                )
+                outputs.append(path)
+            return outputs
+
+    result = LiveChunkProcessor(
+        config,
+        tmp_path / "out",
+        LoudSixStemEngine(),
+        expected_stems=profile.stems,
+        stem_sources=dict(zip(profile.stems, profile.source_groups, strict=True)),
+    ).process(discover_ready_chunks(tmp_path)[0])
+
+    manifest = json.loads(result.manifest.read_text(encoding="utf-8"))
+    instrumental = tmp_path / "out" / manifest["stems"]["instrumental"]
+    assert _first_pcm16_sample(instrumental) == 32_767

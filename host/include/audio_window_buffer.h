@@ -13,7 +13,7 @@ struct AudioGeometry {
     std::uint16_t channels{2};
     std::uint16_t bits_per_sample{16};
     std::uint32_t window_seconds{12};
-    std::uint32_t hop_seconds{12};
+    std::uint32_t hop_seconds{6};
 
     [[nodiscard]] std::size_t bytes_per_frame() const;
     [[nodiscard]] std::size_t window_bytes() const;

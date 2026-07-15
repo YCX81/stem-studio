@@ -11,7 +11,12 @@ from stemstudio.core import (
 
 
 def test_live_profiles_define_models_and_monitorable_stems() -> None:
-    assert LIVE_PROFILES["人声 / 伴奏 · 高质量"].stems == ("vocals", "instrumental")
+    two_track = LIVE_PROFILES["人声 / 伴奏 · 高质量"]
+    assert two_track.stems == ("vocals", "instrumental")
+    assert dict(zip(two_track.stems, two_track.source_groups, strict=True)) == {
+        "vocals": ("vocals",),
+        "instrumental": ("drums", "bass", "guitar", "piano", "other"),
+    }
     assert LIVE_PROFILES["四轨 · 人声/鼓/贝斯/其他"].stems == (
         "vocals",
         "drums",
@@ -26,9 +31,24 @@ def test_live_profiles_define_models_and_monitorable_stems() -> None:
         "piano",
         "other",
     )
-    assert {profile.model_filename for profile in LIVE_PROFILES.values()} == set(
-        MODEL_PROFILES.values()
-    )
+    assert dict(
+        zip(
+            LIVE_PROFILES["四轨 · 人声/鼓/贝斯/其他"].stems,
+            LIVE_PROFILES["四轨 · 人声/鼓/贝斯/其他"].source_groups,
+            strict=True,
+        )
+    )["other"] == ("guitar", "piano", "other")
+    assert {profile.model_filename for profile in LIVE_PROFILES.values()} == {
+        MODEL_PROFILES["六轨 · 加吉他/钢琴"]
+    }
+
+
+def test_live_profile_labels_do_not_misrepresent_offline_quality_models() -> None:
+    assert [profile.display_name for profile in LIVE_PROFILES.values()] == [
+        "二轨 · 实时人声/伴奏",
+        "四轨 · 实时人声/鼓/贝斯/其他",
+        "六轨 · 实时完整分轨",
+    ]
 
 
 def test_request_accepts_supported_audio_and_creates_job_folder(tmp_path: Path) -> None:

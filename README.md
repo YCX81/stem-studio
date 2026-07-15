@@ -101,6 +101,16 @@ docker compose logs -f app
 
 脚本会解决中文路径构建问题，输出 `airplay-host/bin/stem-studio-airplay-host.exe`，递归收集运行时 DLL，并打包最小 GStreamer 插件集。正常使用和迁移包不要求目标电脑安装 MSYS2。
 
+### 安全部署原生宿主候选
+
+开发构建应先输出到 `data/temp/audio-host-next` 与 `data/temp/airplay-host-next`，不要覆盖正在播放的宿主。部署前可做完全只读的检查：
+
+```powershell
+.\scripts\Install-NativeHosts.ps1 -ReadinessOnly
+```
+
+活动 PCM 会返回 `ActiveStream`。暂停手机播放并保持 PCM 帧计数至少 5 秒不增长后，再运行安装器；也可通过 `-ExpectedAudioHash` 与 `-ExpectedAirPlayHash` 固定本次批准的候选哈希。安装器先把完整 AirPlay/GStreamer 包复制到同盘事务目录并校验递归文件清单，随后只停止两个原生宿主和 Controller，以目录重命名完成切换，再恢复原来的二/四/六轨配置。Docker、GPU worker、歌曲缓存和播放队列目录不会重启或删除。新宿主启动、进程优先级或哈希验证失败时会自动恢复旧音频宿主与完整 AirPlay 包；事务与回滚结果记录在 `data/temp/native-update-state.json`。
+
 本机 RTX 5060 Ti 8GB、12 秒真实捕获窗口的常驻模型稳态实测：
 
 | 实时输出模式 | 12 秒窗口处理 | 相对 6 秒步进余量 |

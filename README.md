@@ -177,7 +177,7 @@ Windows 的进程环回捕获位于应用音量之后。本机验证表明：直
 .\scripts\Export-Migration.ps1 -Destination D:\Transfer -IncludeModels
 ```
 
-导出后会生成 ZIP、对应的 `.sha256` 和 `migration-manifest.json`。复制后先验证：
+导出后会生成 ZIP、对应的 `.sha256` 和 `migration-manifest.json`。ZIP 包含自包含 AirPlay 运行时、固定的 UxPlay 源码与许可证、验收文档和 `tools/monitor_live_acceptance.py`，但会剔除所有 `*.next.exe` 开发候选以及 `data/live`、`data/temp`、私人输出。清单同时记录实际交付的音频宿主 EXE、AirPlay EXE 与完整 AirPlay/GStreamer 包哈希，不包含源电脑名。复制后先验证：
 
 ```powershell
 .\scripts\Verify-Package.ps1 -FilePath D:\Transfer\StemStudio-with-models.zip

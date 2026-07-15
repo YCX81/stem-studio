@@ -1,24 +1,26 @@
 ﻿param(
     [Parameter(Mandatory = $true)]
     [string]$Destination,
+    [string]$SourceRoot = '',
     [switch]$IncludeModels,
     [switch]$IncludeImage
 )
 
 $ErrorActionPreference = 'Stop'
-$root = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot 'MigrationPackage.Core.ps1')
+$root = if ($SourceRoot) {
+    [System.IO.Path]::GetFullPath($SourceRoot)
+} else {
+    Split-Path -Parent $PSScriptRoot
+}
 $destinationPath = [System.IO.Path]::GetFullPath($Destination)
 $archiveName = if ($IncludeModels) { 'StemStudio-with-models.zip' } else { 'StemStudio.zip' }
 $archivePath = Join-Path $destinationPath $archiveName
 New-Item -ItemType Directory -Force -Path $destinationPath | Out-Null
 
-$items = @(
-    'src', 'scripts', 'host', 'airplay-host', 'third_party/UxPlay', 'Dockerfile', 'compose.yaml', 'pyproject.toml',
-    'README.md', '.dockerignore', '.gitignore'
-)
-if ($IncludeModels) {
-    $items += 'data/models'
-}
+$items = @(Get-MigrationPackageItems -IncludeModels:$IncludeModels)
+$nativeRuntimeManifest = $null
+$removedCandidates = 0
 
 Push-Location $root
 try {
@@ -45,6 +47,10 @@ try {
     Get-ChildItem -LiteralPath $stagingPath -File -Recurse |
         Where-Object { $_.Extension -in @('.pyc', '.pyo') } |
         Remove-Item -Force
+    $removedCandidates = Remove-MigrationExcludedArtifacts `
+        -StagingRoot $stagingPath `
+        -AllowedRoot $destinationPath
+    $nativeRuntimeManifest = Get-MigrationNativeRuntimeManifest -Root $stagingPath
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     [System.IO.Compression.ZipFile]::CreateFromDirectory(
         $stagingPath,
@@ -96,6 +102,7 @@ $manifest = [ordered]@{
     archive_sha256 = $archiveHash
     includes_models = [bool]$IncludeModels
     includes_image = [bool]$IncludeImage
-    source_machine = $env:COMPUTERNAME
+    native_runtime = $nativeRuntimeManifest
+    excluded_next_host_candidates = $removedCandidates
 }
-$manifest | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $destinationPath 'migration-manifest.json') -Encoding UTF8
+$manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $destinationPath 'migration-manifest.json') -Encoding UTF8

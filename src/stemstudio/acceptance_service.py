@@ -6,7 +6,7 @@ import threading
 import time
 from pathlib import Path
 
-from .acceptance import LiveAcceptanceRecorder
+from .acceptance import DEFAULT_MIXER_LATENCY_LIMIT_MS, LiveAcceptanceRecorder
 from .live_control import (
     _read_status,
     _replace_with_sharing_retry,
@@ -21,7 +21,7 @@ class LiveAcceptanceService:
         self,
         live_root: str | Path,
         *,
-        mixer_latency_limit_ms: float = 100.0,
+        mixer_latency_limit_ms: float = DEFAULT_MIXER_LATENCY_LIMIT_MS,
     ) -> None:
         self.live_root = Path(live_root)
         self.report_path = self.live_root / "acceptance-report.json"

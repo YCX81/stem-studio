@@ -71,6 +71,7 @@ def test_embedded_acceptance_service_resets_on_new_start_command(
         {"sequence": 1, "action": "start_airplay"},
     )
     service = LiveAcceptanceService(tmp_path)
+    assert service.mixer_latency_limit_ms == 50.0
 
     first = service.sample(observed_at_ns=1)
     (tmp_path / "inbox" / "capture-00000002.wav").touch()

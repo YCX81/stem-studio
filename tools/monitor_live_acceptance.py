@@ -4,20 +4,102 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
+from typing import BinaryIO, Iterator
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_REPORT_PATH = PROJECT_ROOT / "data" / "live" / "acceptance-monitor-report.json"
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from stemstudio.acceptance import LiveAcceptanceRecorder
+from stemstudio.acceptance import (
+    DEFAULT_MIXER_LATENCY_LIMIT_MS,
+    LiveAcceptanceRecorder,
+)
 from stemstudio.live_control import live_pipeline_snapshot
+
+
+class MonitorAlreadyRunning(RuntimeError):
+    def __init__(self, pid: int | None) -> None:
+        self.pid = pid
+        suffix = f" (pid {pid})" if pid is not None else ""
+        super().__init__(f"acceptance monitor is already running{suffix}")
+
+
+def _lock_file(handle: BinaryIO) -> None:
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock_file(handle: BinaryIO) -> None:
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _write_pid(pid_path: Path, pid: int) -> None:
+    pid_path.write_text(f"{pid}\n", encoding="ascii")
+
+
+def _read_pid(pid_path: Path) -> int | None:
+    try:
+        pid = int(pid_path.read_text(encoding="ascii").strip())
+        return pid if pid > 0 else None
+    except (OSError, ValueError):
+        return None
+
+
+@contextmanager
+def _exclusive_monitor(pid_path: Path) -> Iterator[None]:
+    """Hold an OS-owned lock so a crash cannot leave the monitor blocked."""
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = pid_path.with_name(f"{pid_path.name}.lock")
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    handle = os.fdopen(descriptor, "r+b")
+    try:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        try:
+            _lock_file(handle)
+        except OSError as exc:
+            owner_pid = _read_pid(pid_path)
+            raise MonitorAlreadyRunning(owner_pid) from exc
+
+        try:
+            _write_pid(pid_path, os.getpid())
+            yield
+        finally:
+            _write_pid(pid_path, 0)
+            _unlock_file(handle)
+    finally:
+        handle.close()
 
 
 def _atomic_json(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    partial = path.with_suffix(f"{path.suffix}.part")
+    partial = path.with_name(
+        f"{path.name}.monitor-{os.getpid()}-{threading.get_ident()}.part"
+    )
     partial.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
@@ -44,13 +126,39 @@ def monitor(
 ) -> int:
     if timeout_seconds <= 0.0 or poll_seconds <= 0.0:
         raise ValueError("timeout and poll interval must be positive")
+    try:
+        with _exclusive_monitor(pid_path):
+            return _monitor_exclusive(
+                live_root=live_root,
+                report_path=report_path,
+                timeout_seconds=timeout_seconds,
+                poll_seconds=poll_seconds,
+                mixer_latency_limit_ms=mixer_latency_limit_ms,
+            )
+    except MonitorAlreadyRunning as exc:
+        print(
+            json.dumps(
+                {"state": "already_running", "pid": exc.pid},
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+        return 4
+
+
+def _monitor_exclusive(
+    *,
+    live_root: Path,
+    report_path: Path,
+    timeout_seconds: float,
+    poll_seconds: float,
+    mixer_latency_limit_ms: float,
+) -> int:
     recorder = LiveAcceptanceRecorder(
         mixer_latency_limit_ms=mixer_latency_limit_ms,
     )
     started = time.monotonic()
     last_state = ""
-    pid_path.parent.mkdir(parents=True, exist_ok=True)
-    pid_path.write_text(f"{os.getpid()}\n", encoding="ascii")
     try:
         while True:
             recorder.observe(live_pipeline_snapshot(live_root))
@@ -87,12 +195,6 @@ def monitor(
         report["passed"] = False
         _atomic_json(report_path, report)
         return 130
-    finally:
-        try:
-            if int(pid_path.read_text(encoding="ascii").strip()) == os.getpid():
-                pid_path.unlink(missing_ok=True)
-        except (OSError, ValueError):
-            pass
 
 
 def main() -> None:
@@ -103,7 +205,7 @@ def main() -> None:
     parser.add_argument(
         "--report",
         type=Path,
-        default=PROJECT_ROOT / "data" / "live" / "acceptance-report.json",
+        default=DEFAULT_REPORT_PATH,
     )
     parser.add_argument(
         "--pid-file",
@@ -112,7 +214,11 @@ def main() -> None:
     )
     parser.add_argument("--timeout-seconds", type=float, default=1800.0)
     parser.add_argument("--poll-seconds", type=float, default=0.1)
-    parser.add_argument("--mixer-latency-limit-ms", type=float, default=100.0)
+    parser.add_argument(
+        "--mixer-latency-limit-ms",
+        type=float,
+        default=DEFAULT_MIXER_LATENCY_LIMIT_MS,
+    )
     args = parser.parse_args()
     raise SystemExit(
         monitor(

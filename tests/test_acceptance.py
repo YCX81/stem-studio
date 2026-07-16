@@ -7,7 +7,10 @@ def _snapshot(**overrides) -> dict:
         "playback_state": "prebuffering",
         "captured_sequence": 148,
         "gpu_sequence": 148,
+        "skipped_sequence": 0,
         "underruns": 0,
+        "device_recoveries": 0,
+        "device_recovering": False,
         "mixer_updates": 12,
         "last_mixer_control_latency_ms": 0.0,
         "cache_hits": 0,
@@ -33,11 +36,12 @@ def test_acceptance_waits_until_real_streaming_evidence_exists() -> None:
 
     assert report["state"] == "waiting_for_phone"
     assert report["passed"] is False
+    assert report["mixer_latency_limit_ms"] == 50.0
     assert report["requirements"]["stream_received"] is False
 
 
 def test_acceptance_passes_first_play_replay_and_live_mixer_evidence() -> None:
-    recorder = LiveAcceptanceRecorder(mixer_latency_limit_ms=100.0)
+    recorder = LiveAcceptanceRecorder()
     recorder.observe(_snapshot(), observed_at_ns=1)
     recorder.observe(
         _snapshot(
@@ -107,6 +111,56 @@ def test_acceptance_passes_first_play_replay_and_live_mixer_evidence() -> None:
     ]
 
 
+def test_acceptance_rejects_a_mixer_update_above_the_default_50ms_limit() -> None:
+    recorder = LiveAcceptanceRecorder()
+    recorder.observe(_snapshot(), observed_at_ns=1)
+    recorder.observe(
+        _snapshot(
+            streaming=True,
+            playback_state="playing",
+            captured_sequence=149,
+            gpu_sequence=149,
+            cache_misses=1,
+        ),
+        observed_at_ns=2,
+    )
+    recorder.observe(
+        _snapshot(
+            streaming=True,
+            playback_state="playing",
+            captured_sequence=150,
+            gpu_sequence=150,
+            cache_misses=1,
+            songs_cached=1,
+            mixer_updates=13,
+            last_mixer_control_latency_ms=50.001,
+        ),
+        observed_at_ns=3,
+    )
+    recorder.observe(
+        _snapshot(
+            streaming=True,
+            playback_state="playing",
+            captured_sequence=151,
+            gpu_sequence=151,
+            cache_hits=1,
+            cache_misses=1,
+            cache_hit=True,
+            cache_scope="song",
+            songs_cached=1,
+            mixer_updates=13,
+        ),
+        observed_at_ns=4,
+    )
+
+    report = recorder.report(observed_at_ns=5)
+
+    assert report["state"] == "failed"
+    assert report["requirements"]["mixer_adjusted_during_stream"] is True
+    assert report["requirements"]["mixer_latency_below_limit"] is False
+    assert report["metrics"]["max_active_mixer_latency_ms"] == 50.001
+
+
 def test_acceptance_rejects_an_underrun_during_active_playback() -> None:
     recorder = LiveAcceptanceRecorder()
     recorder.observe(_snapshot(), observed_at_ns=1)
@@ -143,6 +197,106 @@ def test_acceptance_rejects_an_underrun_during_active_playback() -> None:
     assert report["state"] == "failed"
     assert report["requirements"]["zero_active_underruns"] is False
     assert report["metrics"]["active_underrun_delta"] == 1
+
+
+def test_acceptance_rejects_a_device_recovery_during_active_playback() -> None:
+    recorder = LiveAcceptanceRecorder()
+    recorder.observe(_snapshot(device_recoveries=1), observed_at_ns=1)
+    recorder.observe(
+        _snapshot(
+            streaming=True,
+            playback_state="playing",
+            captured_sequence=149,
+            gpu_sequence=149,
+            cache_misses=1,
+            device_recoveries=1,
+        ),
+        observed_at_ns=2,
+    )
+    recorder.observe(
+        _snapshot(
+            streaming=True,
+            playback_state="playing",
+            captured_sequence=150,
+            gpu_sequence=150,
+            skipped_sequence=0,
+            cache_hits=1,
+            cache_misses=1,
+            cache_hit=True,
+            cache_scope="song",
+            songs_cached=1,
+            mixer_updates=13,
+            last_mixer_control_latency_ms=20.0,
+            device_recoveries=2,
+        ),
+        observed_at_ns=3,
+    )
+
+    report = recorder.report(observed_at_ns=4)
+
+    assert report["state"] == "failed"
+    assert report["requirements"]["zero_active_device_recoveries"] is False
+    assert report["metrics"]["active_device_recovery_delta"] == 1
+
+
+def test_acceptance_rejects_a_device_still_recovering_when_audio_is_active() -> None:
+    recorder = LiveAcceptanceRecorder()
+    recorder.observe(_snapshot(), observed_at_ns=1)
+    recorder.observe(
+        _snapshot(
+            streaming=True,
+            playback_state="playing",
+            captured_sequence=149,
+            gpu_sequence=149,
+            cache_misses=1,
+            device_recovering=True,
+        ),
+        observed_at_ns=2,
+    )
+
+    report = recorder.report(observed_at_ns=3)
+
+    assert report["requirements"]["zero_active_device_recoveries"] is False
+    assert report["metrics"]["active_device_recovering_seen"] is True
+
+
+def test_acceptance_rejects_a_skipped_sequence_during_active_playback() -> None:
+    recorder = LiveAcceptanceRecorder()
+    recorder.observe(_snapshot(skipped_sequence=148), observed_at_ns=1)
+    recorder.observe(
+        _snapshot(
+            streaming=True,
+            playback_state="playing",
+            captured_sequence=149,
+            gpu_sequence=149,
+            skipped_sequence=148,
+            cache_misses=1,
+        ),
+        observed_at_ns=2,
+    )
+    recorder.observe(
+        _snapshot(
+            streaming=True,
+            playback_state="playing",
+            captured_sequence=150,
+            gpu_sequence=150,
+            skipped_sequence=149,
+            cache_hits=1,
+            cache_misses=1,
+            cache_hit=True,
+            cache_scope="song",
+            songs_cached=1,
+            mixer_updates=13,
+            last_mixer_control_latency_ms=20.0,
+        ),
+        observed_at_ns=3,
+    )
+
+    report = recorder.report(observed_at_ns=4)
+
+    assert report["state"] == "failed"
+    assert report["requirements"]["zero_active_skipped_sequences"] is False
+    assert report["metrics"]["active_skipped_sequence_delta"] == 1
 
 
 def test_acceptance_ignores_mixer_updates_and_underruns_outside_active_audio() -> None:
@@ -184,6 +338,76 @@ def test_acceptance_ignores_mixer_updates_and_underruns_outside_active_audio() -
 
     assert report["requirements"]["mixer_adjusted_during_stream"] is False
     assert report["metrics"]["active_underrun_delta"] == 0
+
+
+def test_acceptance_ignores_idle_continuity_events_between_first_play_and_replay() -> None:
+    recorder = LiveAcceptanceRecorder()
+    recorder.observe(_snapshot(skipped_sequence=148), observed_at_ns=1)
+    recorder.observe(
+        _snapshot(
+            streaming=True,
+            playback_state="playing",
+            captured_sequence=149,
+            gpu_sequence=149,
+            skipped_sequence=148,
+            cache_misses=1,
+        ),
+        observed_at_ns=2,
+    )
+    recorder.observe(
+        _snapshot(
+            streaming=True,
+            playback_state="playing",
+            captured_sequence=150,
+            gpu_sequence=150,
+            skipped_sequence=148,
+            cache_misses=2,
+            songs_cached=1,
+            mixer_updates=13,
+            last_mixer_control_latency_ms=20.0,
+        ),
+        observed_at_ns=3,
+    )
+    recorder.observe(
+        _snapshot(
+            skipped_sequence=149,
+            underruns=1,
+            device_recoveries=1,
+            device_recovering=True,
+            cache_misses=2,
+            songs_cached=1,
+            mixer_updates=14,
+        ),
+        observed_at_ns=4,
+    )
+    recorder.observe(
+        _snapshot(
+            streaming=True,
+            playback_state="playing",
+            captured_sequence=151,
+            gpu_sequence=151,
+            skipped_sequence=149,
+            underruns=1,
+            device_recoveries=1,
+            cache_hits=1,
+            cache_misses=2,
+            cache_hit=True,
+            cache_scope="song",
+            songs_cached=1,
+            mixer_updates=14,
+        ),
+        observed_at_ns=5,
+    )
+
+    report = recorder.report(observed_at_ns=6)
+
+    assert report["state"] == "passed"
+    assert report["requirements"]["zero_active_underruns"] is True
+    assert report["requirements"]["zero_active_device_recoveries"] is True
+    assert report["requirements"]["zero_active_skipped_sequences"] is True
+    assert report["metrics"]["active_underrun_delta"] == 0
+    assert report["metrics"]["active_device_recovery_delta"] == 0
+    assert report["metrics"]["active_skipped_sequence_delta"] == 0
 
 
 def test_acceptance_does_not_keep_a_stale_startup_song_inventory() -> None:

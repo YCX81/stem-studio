@@ -5,10 +5,17 @@ import time
 from collections.abc import Mapping
 
 
+DEFAULT_MIXER_LATENCY_LIMIT_MS = 50.0
+
+
 class LiveAcceptanceRecorder:
     """Aggregate real-phone evidence without treating idle drain as an underrun."""
 
-    def __init__(self, *, mixer_latency_limit_ms: float = 100.0) -> None:
+    def __init__(
+        self,
+        *,
+        mixer_latency_limit_ms: float = DEFAULT_MIXER_LATENCY_LIMIT_MS,
+    ) -> None:
         if not math.isfinite(mixer_latency_limit_ms) or mixer_latency_limit_ms <= 0.0:
             raise ValueError("混音控制延迟上限必须为正数。")
         self.mixer_latency_limit_ms = float(mixer_latency_limit_ms)
@@ -32,10 +39,26 @@ class LiveAcceptanceRecorder:
         self._maximum_pending_windows = 0
         self._minimum_active_buffer_seconds: float | None = None
         self._active_started = False
+        self._active_segment_open = False
         self._active_underrun_baseline = 0
         self._active_underrun_maximum = 0
+        self._completed_active_underrun_delta = 0
+        self._active_underrun_counter_reset_seen = False
+        self._active_device_recovery_baseline = 0
+        self._active_device_recovery_maximum = 0
+        self._completed_active_device_recovery_delta = 0
+        self._active_device_recovery_counter_reset_seen = False
+        self._active_device_recovering_seen = False
+        self._active_skipped_sequence_baseline = 0
+        self._active_skipped_sequence_maximum = 0
+        self._completed_active_skipped_sequence_delta = 0
+        self._active_skipped_sequence_counter_reset_seen = False
         self._active_mixer_baseline = 0
         self._active_mixer_maximum = 0
+        self._completed_active_mixer_update_delta = 0
+        self._previous_underruns = 0
+        self._previous_device_recoveries = 0
+        self._previous_skipped_sequence = 0
         self._previous_mixer_updates = 0
         self._max_active_mixer_latency_ms = 0.0
         self._song_cache_hit_samples = 0
@@ -73,7 +96,10 @@ class LiveAcceptanceRecorder:
         cache_misses = self._count(snapshot, "cache_misses")
         songs_cached = self._count(snapshot, "songs_cached")
         pending_windows = self._count(snapshot, "pending_windows")
+        skipped_sequence = self._count(snapshot, "skipped_sequence")
         underruns = self._count(snapshot, "underruns")
+        device_recoveries = self._count(snapshot, "device_recoveries")
+        device_recovering = snapshot.get("device_recovering") is True
         mixer_updates = self._count(snapshot, "mixer_updates")
         mixer_latency_ms = self._metric(snapshot, "last_mixer_control_latency_ms")
         buffered_seconds = self._metric(snapshot, "ready_buffer_seconds")
@@ -88,6 +114,9 @@ class LiveAcceptanceRecorder:
             self._initial_cache_hits = cache_hits
             self._initial_cache_misses = cache_misses
             self._initial_songs_cached = songs_cached
+            self._previous_underruns = underruns
+            self._previous_device_recoveries = device_recoveries
+            self._previous_skipped_sequence = skipped_sequence
             self._previous_mixer_updates = mixer_updates
         self._last_observed_at_ns = now_ns
         self._samples += 1
@@ -104,12 +133,18 @@ class LiveAcceptanceRecorder:
         self._latest_songs_cached = songs_cached
         self._maximum_pending_windows = max(self._maximum_pending_windows, pending_windows)
 
+        continuing_active_segment = self._active_segment_open
         if active:
             self._active_samples += 1
-            if not self._active_started:
-                self._active_started = True
+            self._active_started = True
+            if not continuing_active_segment:
+                self._active_segment_open = True
                 self._active_underrun_baseline = underruns
                 self._active_underrun_maximum = underruns
+                self._active_device_recovery_baseline = device_recoveries
+                self._active_device_recovery_maximum = device_recoveries
+                self._active_skipped_sequence_baseline = skipped_sequence
+                self._active_skipped_sequence_maximum = skipped_sequence
                 self._active_mixer_baseline = mixer_updates
                 self._active_mixer_maximum = mixer_updates
             else:
@@ -117,11 +152,32 @@ class LiveAcceptanceRecorder:
                     self._active_underrun_maximum,
                     underruns,
                 )
+                self._active_device_recovery_maximum = max(
+                    self._active_device_recovery_maximum,
+                    device_recoveries,
+                )
+                self._active_skipped_sequence_maximum = max(
+                    self._active_skipped_sequence_maximum,
+                    skipped_sequence,
+                )
                 self._active_mixer_maximum = max(
                     self._active_mixer_maximum,
                     mixer_updates,
                 )
-            if mixer_updates > self._previous_mixer_updates:
+                self._active_underrun_counter_reset_seen |= (
+                    underruns < self._previous_underruns
+                )
+                self._active_device_recovery_counter_reset_seen |= (
+                    device_recoveries < self._previous_device_recoveries
+                )
+                self._active_skipped_sequence_counter_reset_seen |= (
+                    skipped_sequence < self._previous_skipped_sequence
+                )
+            self._active_device_recovering_seen |= device_recovering
+            if (
+                continuing_active_segment
+                and mixer_updates > self._previous_mixer_updates
+            ):
                 self._max_active_mixer_latency_ms = max(
                     self._max_active_mixer_latency_ms,
                     mixer_latency_ms,
@@ -151,6 +207,26 @@ class LiveAcceptanceRecorder:
                             "duration_seconds": duration_seconds,
                         }
                     )
+        elif self._active_segment_open:
+            self._completed_active_underrun_delta += max(
+                0,
+                self._active_underrun_maximum - self._active_underrun_baseline,
+            )
+            self._completed_active_device_recovery_delta += max(
+                0,
+                self._active_device_recovery_maximum
+                - self._active_device_recovery_baseline,
+            )
+            self._completed_active_skipped_sequence_delta += max(
+                0,
+                self._active_skipped_sequence_maximum
+                - self._active_skipped_sequence_baseline,
+            )
+            self._completed_active_mixer_update_delta += max(
+                0,
+                self._active_mixer_maximum - self._active_mixer_baseline,
+            )
+            self._active_segment_open = False
 
         if (
             snapshot.get("cache_hit") is True
@@ -158,18 +234,56 @@ class LiveAcceptanceRecorder:
             and cache_hits > self._initial_cache_hits
         ):
             self._song_cache_hit_samples += 1
+        self._previous_underruns = underruns
+        self._previous_device_recoveries = device_recoveries
+        self._previous_skipped_sequence = skipped_sequence
         self._previous_mixer_updates = mixer_updates
 
     def report(self, *, observed_at_ns: int | None = None) -> dict[str, object]:
         now_ns = time.time_ns() if observed_at_ns is None else int(observed_at_ns)
         started_at_ns = self._started_at_ns or now_ns
-        active_underrun_delta = max(
-            0,
-            self._active_underrun_maximum - self._active_underrun_baseline,
+        open_active_underrun_delta = (
+            max(0, self._active_underrun_maximum - self._active_underrun_baseline)
+            if self._active_segment_open
+            else 0
         )
-        active_mixer_update_delta = max(
-            0,
-            self._active_mixer_maximum - self._active_mixer_baseline,
+        active_underrun_delta = (
+            self._completed_active_underrun_delta + open_active_underrun_delta
+        )
+        open_active_device_recovery_delta = (
+            max(
+                0,
+                self._active_device_recovery_maximum
+                - self._active_device_recovery_baseline,
+            )
+            if self._active_segment_open
+            else 0
+        )
+        active_device_recovery_delta = (
+            self._completed_active_device_recovery_delta
+            + open_active_device_recovery_delta
+        )
+        open_active_skipped_sequence_delta = (
+            max(
+                0,
+                self._active_skipped_sequence_maximum
+                - self._active_skipped_sequence_baseline,
+            )
+            if self._active_segment_open
+            else 0
+        )
+        active_skipped_sequence_delta = (
+            self._completed_active_skipped_sequence_delta
+            + open_active_skipped_sequence_delta
+        )
+        open_active_mixer_update_delta = (
+            max(0, self._active_mixer_maximum - self._active_mixer_baseline)
+            if self._active_segment_open
+            else 0
+        )
+        active_mixer_update_delta = (
+            self._completed_active_mixer_update_delta
+            + open_active_mixer_update_delta
         )
         cache_hit_delta = max(0, self._maximum_cache_hits - self._initial_cache_hits)
         cache_miss_delta = max(0, self._maximum_cache_misses - self._initial_cache_misses)
@@ -185,7 +299,20 @@ class LiveAcceptanceRecorder:
             "song_cache_available": self._latest_songs_cached > 0,
             "song_cache_replayed": self._song_cache_hit_samples > 0,
             "zero_active_underruns": (
-                self._active_samples > 0 and active_underrun_delta == 0
+                self._active_samples > 0
+                and active_underrun_delta == 0
+                and not self._active_underrun_counter_reset_seen
+            ),
+            "zero_active_device_recoveries": (
+                self._active_samples > 0
+                and active_device_recovery_delta == 0
+                and not self._active_device_recovering_seen
+                and not self._active_device_recovery_counter_reset_seen
+            ),
+            "zero_active_skipped_sequences": (
+                self._active_samples > 0
+                and active_skipped_sequence_delta == 0
+                and not self._active_skipped_sequence_counter_reset_seen
             ),
             "mixer_adjusted_during_stream": active_mixer_update_delta > 0,
             "mixer_latency_below_limit": (
@@ -195,7 +322,14 @@ class LiveAcceptanceRecorder:
         }
         passed = all(requirements.values())
         terminal_failure = requirements["song_cache_replayed"] and (
-            not requirements["zero_active_underruns"]
+            not all(
+                requirements[name]
+                for name in (
+                    "zero_active_underruns",
+                    "zero_active_device_recoveries",
+                    "zero_active_skipped_sequences",
+                )
+            )
             or (
                 requirements["mixer_adjusted_during_stream"]
                 and not requirements["mixer_latency_below_limit"]
@@ -211,7 +345,7 @@ class LiveAcceptanceRecorder:
             else "in_progress"
         )
         return {
-            "version": 1,
+            "version": 2,
             "state": state,
             "passed": passed,
             "started_at_ns": started_at_ns,
@@ -239,6 +373,18 @@ class LiveAcceptanceRecorder:
                 "songs_cached_latest": self._latest_songs_cached,
                 "song_cache_hit_samples": self._song_cache_hit_samples,
                 "active_underrun_delta": active_underrun_delta,
+                "active_underrun_counter_reset_seen": (
+                    self._active_underrun_counter_reset_seen
+                ),
+                "active_device_recovery_delta": active_device_recovery_delta,
+                "active_device_recovering_seen": self._active_device_recovering_seen,
+                "active_device_recovery_counter_reset_seen": (
+                    self._active_device_recovery_counter_reset_seen
+                ),
+                "active_skipped_sequence_delta": active_skipped_sequence_delta,
+                "active_skipped_sequence_counter_reset_seen": (
+                    self._active_skipped_sequence_counter_reset_seen
+                ),
                 "active_mixer_update_delta": active_mixer_update_delta,
                 "max_active_mixer_latency_ms": round(
                     self._max_active_mixer_latency_ms,

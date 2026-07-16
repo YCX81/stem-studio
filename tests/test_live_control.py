@@ -70,7 +70,7 @@ def test_live_pipeline_snapshot_exposes_levels_buffer_and_processing_headroom(tm
     assert "实时输入电平" in dashboard
     assert "12 秒" in dashboard
     assert "2.70 秒 / 6 秒" in dashboard
-    assert "100 ms" in dashboard
+    assert "50 ms" in dashboard
     assert "持久 WASAPI 输出队列" in dashboard
 
 
@@ -168,6 +168,7 @@ def test_live_pipeline_snapshot_prefers_native_queue_and_mixer_metrics(tmp_path:
                 "version": 2,
                 "state": "playing",
                 "sequence": 9,
+                "skipped_sequence": 8,
                 "buffered_seconds": 18.4,
                 "prebuffer_seconds": 12.0,
                 "underruns": 2,
@@ -196,6 +197,7 @@ def test_live_pipeline_snapshot_prefers_native_queue_and_mixer_metrics(tmp_path:
     snapshot = live_pipeline_snapshot(tmp_path)
 
     assert snapshot["ready_buffer_seconds"] == 18.4
+    assert snapshot["skipped_sequence"] == 8
     assert snapshot["prebuffer_seconds"] == 12.0
     assert snapshot["underruns"] == 2
     assert snapshot["last_underrun_system_time_ns"] == 1_700_000_000_000_000_000
@@ -380,6 +382,8 @@ def test_live_dashboard_exposes_waiting_real_phone_acceptance(tmp_path: Path) ->
                     "song_cache_available": False,
                     "song_cache_replayed": False,
                     "zero_active_underruns": False,
+                    "zero_active_device_recoveries": False,
+                    "zero_active_skipped_sequences": False,
                     "mixer_adjusted_during_stream": False,
                     "mixer_latency_below_limit": False,
                 },
@@ -395,6 +399,8 @@ def test_live_dashboard_exposes_waiting_real_phone_acceptance(tmp_path: Path) ->
     assert snapshot["acceptance_requirements"]["stream_received"] is False
     assert "真机自动验收：等待手机" in dashboard
     assert "手机音频 ○" in dashboard
+    assert "播放中声卡零重连 ○" in dashboard
+    assert "播放中分轨零跳窗 ○" in dashboard
     assert "播放中调音 ○" in dashboard
 
 
@@ -405,6 +411,8 @@ def test_live_dashboard_marks_real_phone_acceptance_passed(tmp_path: Path) -> No
         "song_cache_available": True,
         "song_cache_replayed": True,
         "zero_active_underruns": True,
+        "zero_active_device_recoveries": True,
+        "zero_active_skipped_sequences": True,
         "mixer_adjusted_during_stream": True,
         "mixer_latency_below_limit": True,
     }
@@ -427,6 +435,8 @@ def test_live_dashboard_marks_real_phone_acceptance_passed(tmp_path: Path) -> No
     assert "真机自动验收：全部通过" in dashboard
     assert "歌曲缓存重播 ✓" in dashboard
     assert "播放中零欠载 ✓" in dashboard
+    assert "播放中声卡零重连 ✓" in dashboard
+    assert "播放中分轨零跳窗 ✓" in dashboard
 
 
 def test_live_dashboard_labels_cross_song_composite_cache_hit(tmp_path: Path) -> None:
@@ -510,6 +520,7 @@ def test_live_ui_defaults_follow_active_airplay_profile_and_mixer(tmp_path: Path
         ),
         encoding="utf-8",
     )
+    (tmp_path / "controller-heartbeat.json").write_text("{}", encoding="utf-8")
     (tmp_path / "playback-status.json").write_text(
         json.dumps(
             {
@@ -532,6 +543,28 @@ def test_live_ui_defaults_follow_active_airplay_profile_and_mixer(tmp_path: Path
     assert defaults["profile_name"] == "六轨 · 加吉他/钢琴"
     assert defaults["gains"]["vocals"] == 0.0
     assert defaults["gains"]["piano"] == 0.8
+
+
+def test_live_ui_defaults_reject_stale_active_controller_state(tmp_path: Path) -> None:
+    (tmp_path / "controller-status.json").write_text(
+        json.dumps(
+            {
+                "state": "airplay_waiting",
+                "input_source": "airplay",
+                "profile_name": "六轨 · 加吉他/钢琴",
+            }
+        ),
+        encoding="utf-8",
+    )
+    heartbeat = tmp_path / "controller-heartbeat.json"
+    heartbeat.write_text("{}", encoding="utf-8")
+    stale_time = time.time() - 10.0
+    os.utime(heartbeat, (stale_time, stale_time))
+
+    defaults = live_ui_defaults(tmp_path)
+
+    assert defaults["input_source"] == "process"
+    assert defaults["profile_name"] == "人声 / 伴奏 · 高质量"
 
 
 def test_live_ui_defaults_ignore_stale_airplay_command_when_controller_stopped(
@@ -828,6 +861,7 @@ def test_status_markdown_combines_capture_and_gpu_state(tmp_path: Path) -> None:
     (tmp_path / "controller-status.json").write_text(
         json.dumps({"state": "capturing", "process_id": 42}), encoding="utf-8"
     )
+    (tmp_path / "controller-heartbeat.json").write_text("{}", encoding="utf-8")
     (tmp_path / "gpu-status.json").write_text(
         json.dumps({"state": "running", "last_sequence": 3}), encoding="utf-8"
     )
@@ -841,6 +875,7 @@ def test_status_markdown_reports_airplay_waiting_and_streaming(tmp_path: Path) -
         json.dumps({"state": "airplay_waiting", "profile_name": "四轨 · 人声/鼓/贝斯/其他"}),
         encoding="utf-8",
     )
+    (tmp_path / "controller-heartbeat.json").write_text("{}", encoding="utf-8")
     (tmp_path / "airplay-status.json").write_text(
         json.dumps({"state": "waiting", "enabled": True, "receiver": "Stem Studio"}),
         encoding="utf-8",
@@ -864,3 +899,44 @@ def test_status_markdown_reports_airplay_waiting_and_streaming(tmp_path: Path) -
     assert "AirPlay PCM 正在接收" in status
     assert "ALAC" in status
     assert "窗口 2" in status
+
+
+def test_active_controller_status_without_a_fresh_heartbeat_is_reported_offline(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "controller-status.json").write_text(
+        json.dumps({"state": "airplay_waiting", "profile_name": "六轨 · 加吉他/钢琴"}),
+        encoding="utf-8",
+    )
+    heartbeat = tmp_path / "controller-heartbeat.json"
+    heartbeat.write_text(json.dumps({"version": 1, "pid": 42}), encoding="utf-8")
+    stale_time = time.time() - 10.0
+    os.utime(heartbeat, (stale_time, stale_time))
+    (tmp_path / "airplay-status.json").write_text(
+        json.dumps({"state": "waiting", "enabled": True, "receiver": "Stem Studio"}),
+        encoding="utf-8",
+    )
+
+    snapshot = live_pipeline_snapshot(tmp_path)
+
+    assert snapshot["controller_online"] is False
+    assert snapshot["controller_stalled"] is True
+    assert snapshot["controller_heartbeat_age_seconds"] >= 9.0
+    assert "控制器心跳已停止" in status_markdown(tmp_path)
+    assert "控制器已离线" in live_dashboard_html(tmp_path)
+
+
+def test_fresh_controller_heartbeat_keeps_active_controller_online(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "controller-status.json").write_text(
+        json.dumps({"state": "airplay_waiting"}),
+        encoding="utf-8",
+    )
+    (tmp_path / "controller-heartbeat.json").write_text("{}", encoding="utf-8")
+
+    snapshot = live_pipeline_snapshot(tmp_path)
+
+    assert snapshot["controller_online"] is True
+    assert snapshot["controller_stalled"] is False
+    assert snapshot["controller_heartbeat_age_seconds"] < 1.0

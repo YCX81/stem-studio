@@ -22,6 +22,7 @@ $airplayPriority = $null
 $activeProfileName = ''
 $activeLanInterface = $null
 $audioScanCountdown = 0
+$controllerHeartbeat = Join-Path $live 'controller-heartbeat.json'
 
 function Write-AtomicJson([string]$Path, $Value) {
     $partial = "$Path.part"
@@ -129,6 +130,7 @@ Write-AtomicJson (Join-Path $live 'controller-status.json') ([ordered]@{ state='
 
 try {
     while ($true) {
+        Write-AtomicJson $controllerHeartbeat (New-ControllerHeartbeat -ProcessId $PID)
         if ($audioScanCountdown -le 0) {
             Update-AudioRouting
             $audioScanCountdown = 5
@@ -226,5 +228,6 @@ try {
         Start-Sleep -Seconds 2
     }
 } finally {
+    Remove-Item -LiteralPath $controllerHeartbeat -Force -ErrorAction SilentlyContinue
     Stop-Capture
 }

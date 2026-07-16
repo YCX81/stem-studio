@@ -164,6 +164,33 @@ def input_source_changed(input_source: str):
     return gr.Dropdown(visible=input_source == "process")
 
 
+def restore_live_controls():
+    restored = live_ui_defaults(LIVE_DIR)
+    input_source = restored["input_source"]
+    profile_name = restored["profile_name"]
+    gains = restored["gains"]
+    visibility = active_stem_visibility(profile_name)
+    process_choices = read_processes(LIVE_DIR) if input_source == "process" else []
+    process_value = process_choices[0][1] if process_choices else None
+    return (
+        gr.Radio(value=input_source),
+        gr.Dropdown(
+            choices=process_choices,
+            value=process_value,
+            visible=input_source == "process",
+        ),
+        gr.Dropdown(value=profile_name),
+        *(
+            gr.Slider(
+                value=round(gains[stem] * 100),
+                visible=visibility[stem],
+            )
+            for stem in STEM_ORDER
+        ),
+        "🟢 **已恢复当前混音器状态**",
+    )
+
+
 def refresh_live_dashboard() -> tuple[str, str]:
     return status_markdown(LIVE_DIR), live_dashboard_html(LIVE_DIR)
 
@@ -322,9 +349,8 @@ def build_app() -> gr.Blocks:
                     queue=False,
                 )
                 app.load(
-                    refresh_mixer_sliders,
-                    inputs=mixer_inputs,
-                    outputs=mixer_outputs,
+                    restore_live_controls,
+                    outputs=[input_source, live_process, live_profile, *mixer_outputs],
                     queue=False,
                 )
                 for slider in mixer_sliders:

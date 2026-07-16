@@ -31,6 +31,7 @@ _ATOMIC_REPLACE_ATTEMPTS = 50
 _ATOMIC_REPLACE_RETRY_SECONDS = 0.002
 _STATUS_READ_ATTEMPTS = 5
 _AIRPLAY_STREAM_STALE_SECONDS = 2.0
+_CONTROLLER_HEARTBEAT_STALE_SECONDS = 6.0
 
 
 def _replace_with_sharing_retry(source: Path, destination: Path) -> None:
@@ -83,15 +84,22 @@ def live_ui_defaults(live_root: str | Path) -> dict:
     root = Path(live_root)
     controller = _read_status(root / "controller-status.json")
     state = str(controller.get("state", ""))
+    controller_heartbeat_age_seconds = _status_age_seconds(
+        root / "controller-heartbeat.json"
+    )
+    controller_online = (
+        controller_heartbeat_age_seconds is not None
+        and controller_heartbeat_age_seconds <= _CONTROLLER_HEARTBEAT_STALE_SECONDS
+    )
     input_source = "process"
     profile_name = "人声 / 伴奏 · 高质量"
 
-    if state == "airplay_waiting":
+    if state == "airplay_waiting" and controller_online:
         input_source = "airplay"
         candidate = controller.get("profile_name")
         if candidate in LIVE_PROFILES:
             profile_name = str(candidate)
-    elif state == "capturing":
+    elif state == "capturing" and controller_online:
         candidate = controller.get("profile_name")
         if candidate in LIVE_PROFILES:
             profile_name = str(candidate)
@@ -127,6 +135,19 @@ def live_ui_defaults(live_root: str | Path) -> dict:
 
 def live_pipeline_snapshot(live_root: str | Path) -> dict:
     root = Path(live_root)
+    controller = _read_status(root / "controller-status.json")
+    controller_state = str(controller.get("state", ""))
+    controller_heartbeat_age_seconds = _status_age_seconds(
+        root / "controller-heartbeat.json"
+    )
+    controller_online = (
+        controller_heartbeat_age_seconds is not None
+        and controller_heartbeat_age_seconds <= _CONTROLLER_HEARTBEAT_STALE_SECONDS
+    )
+    controller_stalled = (
+        controller_state in {"airplay_waiting", "capturing"}
+        and not controller_online
+    )
     airplay_path = root / "airplay-status.json"
     airplay = _read_status(airplay_path)
     airplay_status_age_seconds = _status_age_seconds(airplay_path)
@@ -156,6 +177,8 @@ def live_pipeline_snapshot(live_root: str | Path) -> dict:
         "song_cache_available",
         "song_cache_replayed",
         "zero_active_underruns",
+        "zero_active_device_recoveries",
+        "zero_active_skipped_sequences",
         "mixer_adjusted_during_stream",
         "mixer_latency_below_limit",
     )
@@ -302,6 +325,14 @@ def live_pipeline_snapshot(live_root: str | Path) -> dict:
         return value if math.isfinite(value) and value >= 0.0 else 0.0
 
     return {
+        "controller_state": controller_state,
+        "controller_online": controller_online,
+        "controller_stalled": controller_stalled,
+        "controller_heartbeat_age_seconds": (
+            round(controller_heartbeat_age_seconds, 3)
+            if controller_heartbeat_age_seconds is not None
+            else None
+        ),
         "streaming": streaming,
         "stream_stalled": stream_stalled,
         "airplay_status_age_seconds": (
@@ -326,6 +357,7 @@ def live_pipeline_snapshot(live_root: str | Path) -> dict:
         "captured_sequence": captured_sequence,
         "gpu_sequence": gpu_sequence,
         "playback_sequence": playback_sequence,
+        "skipped_sequence": max(0, int(nonnegative_number("skipped_sequence"))),
         "playback_state": str(playback.get("state", "waiting")),
         "pending_windows": max(0, captured_sequence - gpu_sequence),
         "ready_buffer_seconds": round(ready_buffer_seconds, 3),
@@ -392,6 +424,12 @@ def live_pipeline_snapshot(live_root: str | Path) -> dict:
         "acceptance_requirements": acceptance_requirements,
         "acceptance_active_samples": acceptance_count("active_samples"),
         "active_underrun_delta": acceptance_count("active_underrun_delta"),
+        "active_device_recovery_delta": acceptance_count(
+            "active_device_recovery_delta"
+        ),
+        "active_skipped_sequence_delta": acceptance_count(
+            "active_skipped_sequence_delta"
+        ),
     }
 
 
@@ -403,9 +441,20 @@ def live_dashboard_html(live_root: str | Path) -> str:
     )
     streaming = snapshot["streaming"]
     stream_stalled = snapshot["stream_stalled"]
-    state_class = "ok" if streaming else "bad" if stream_stalled else "idle"
+    controller_stalled = snapshot["controller_stalled"]
+    state_class = (
+        "bad"
+        if controller_stalled
+        else "ok"
+        if streaming
+        else "bad"
+        if stream_stalled
+        else "idle"
+    )
     state_text = (
-        "正在接收音频"
+        "控制器已离线"
+        if controller_stalled
+        else "正在接收音频"
         if streaming
         else "上游 PCM 已停止"
         if stream_stalled
@@ -429,7 +478,15 @@ def live_dashboard_html(live_root: str | Path) -> str:
         processing_text = "—"
     else:
         processing_text = f"{processing:.2f} 秒 / {snapshot['hop_seconds']:g} 秒"
-    if snapshot["device_recovering"]:
+    if controller_stalled:
+        continuity_class = "bad"
+        age = snapshot["controller_heartbeat_age_seconds"]
+        age_text = f"{age:.1f} 秒" if age is not None else "未知时长"
+        continuity = (
+            f"Windows 音频控制器心跳已停止 {age_text}；当前状态可能已经过期，"
+            "请重新启动 Stem Studio，避免失去宿主退出检测和自动恢复。"
+        )
+    elif snapshot["device_recovering"]:
         continuity_class = "warm"
         device_error = html.escape(snapshot["last_device_hresult"] or "输出端点暂不可用")
         continuity = (
@@ -441,6 +498,18 @@ def live_dashboard_html(live_root: str | Path) -> str:
         continuity = (
             "AirPlay 上游 PCM 已停止更新；手机可能已暂停、断开，或接收端停止供数。"
             "队列自然排空不计为流内欠载。"
+        )
+    elif snapshot["active_device_recovery_delta"]:
+        continuity_class = "bad"
+        continuity = (
+            f"本次连续播放中声卡端点重连 {snapshot['active_device_recovery_delta']} 次，"
+            "即使多轨队列未欠载也可能产生可闻断点；本次验收不会通过。"
+        )
+    elif snapshot["active_skipped_sequence_delta"]:
+        continuity_class = "bad"
+        continuity = (
+            f"本次连续播放中分轨结果跳窗 {snapshot['active_skipped_sequence_delta']} 次，"
+            "时间轴可能发生跳跃；本次验收不会通过。"
         )
     elif snapshot["active_underrun_delta"]:
         continuity_class = "bad"
@@ -592,8 +661,10 @@ def live_dashboard_html(live_root: str | Path) -> str:
         ("song_cache_available", "整曲缓存"),
         ("song_cache_replayed", "歌曲缓存重播"),
         ("zero_active_underruns", "播放中零欠载"),
+        ("zero_active_device_recoveries", "播放中声卡零重连"),
+        ("zero_active_skipped_sequences", "播放中分轨零跳窗"),
         ("mixer_adjusted_during_stream", "播放中调音"),
-        ("mixer_latency_below_limit", "调音延迟 ≤ 100 ms"),
+        ("mixer_latency_below_limit", "调音延迟 ≤ 50 ms"),
     )
     acceptance_checklist = " · ".join(
         f"{label} {'✓' if snapshot['acceptance_requirements'][name] else '○'}"
@@ -639,7 +710,7 @@ def live_dashboard_html(live_root: str | Path) -> str:
         <div><b>{snapshot['playback_sequence']}</b><small>正在监听</small></div>
       </div>
       <div class="stem-note">待处理 {snapshot['pending_windows']} 窗 · 可播放缓存 {snapshot['ready_buffer_seconds']:g} 秒 · 预缓冲 {snapshot['prebuffer_seconds']:g} 秒 · 单窗耗时 {processing_text}</div>
-      <div class="stem-note">设备打开 {snapshot['device_open_count']} 次 · 自动恢复 {snapshot['device_recoveries']} 次 · 设备缓冲 {snapshot['device_buffer_ms']:g} ms · 累计欠载 {snapshot['underruns']} 次{underrun_event_text}</div>
+      <div class="stem-note">设备打开 {snapshot['device_open_count']} 次 · 自动恢复 {snapshot['device_recoveries']} 次 · 分轨跳窗至 {snapshot['skipped_sequence']} · 设备缓冲 {snapshot['device_buffer_ms']:g} ms · 累计欠载 {snapshot['underruns']} 次{underrun_event_text}</div>
       <div class="stem-note">混音控制 {snapshot['mixer_updates']} 次 · 最近 {snapshot['last_mixer_control_latency_ms']:g} ms · 最慢 {snapshot['max_mixer_control_latency_ms']:g} ms · {snapshot['gain_smoothing_ms']:g} ms 平滑</div>
       <div class="stem-note">相邻结果按同一时间轴交叠 {snapshot['overlap_milliseconds']:g} ms 后平滑拼接</div>
       <div class="stem-note">{gain_text}</div>
@@ -842,6 +913,14 @@ def routing_markdown(live_root: str | Path) -> str:
 
 def status_markdown(live_root: str | Path) -> str:
     root = Path(live_root)
+    pipeline = live_pipeline_snapshot(root)
+    if pipeline["controller_stalled"]:
+        age = pipeline["controller_heartbeat_age_seconds"]
+        age_text = f"{age:.1f} 秒" if age is not None else "未知时长"
+        return (
+            f"🔴 **控制器心跳已停止 {age_text}** · 当前实时状态可能已过期，"
+            "请重新启动 Stem Studio"
+        )
     statuses = []
     for filename in (
         "controller-status.json",
@@ -869,7 +948,6 @@ def status_markdown(live_root: str | Path) -> str:
     gpu = next((item for item in statuses if "last_sequence" in item), {})
     playback = next((item for item in statuses if "stem" in item), {})
     if airplay.get("enabled"):
-        pipeline = live_pipeline_snapshot(root)
         if pipeline["stream_stalled"]:
             return (
                 "🟠 **AirPlay PCM 已停止更新** · 手机可能已暂停或断开，"

@@ -26,6 +26,19 @@ function Get-StreamingPriorityClass {
     return 'AboveNormal'
 }
 
+function New-ControllerHeartbeat {
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [DateTimeOffset]$Timestamp = [DateTimeOffset]::UtcNow
+    )
+
+    [pscustomobject]@{
+        version = 1
+        pid = $ProcessId
+        updated_at = $Timestamp.ToString('o')
+    }
+}
+
 function Set-StreamingProcessPriority {
     param([Parameter(Mandatory = $true)][System.Diagnostics.Process]$Process)
 

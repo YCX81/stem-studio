@@ -1095,6 +1095,11 @@ class LiveWorker:
         results = []
         for index, chunk in enumerate(ready):
             started = time.perf_counter()
+            # Cache errors describe the current processing window. AirPlay can
+            # legitimately publish progress before its title/artist metadata;
+            # do not leave that transient startup error visible after a later
+            # window has recovered. Any failure below records a fresh error.
+            self._last_cache_error = None
             try:
                 annotation = self._load_annotation(chunk)
                 result = self._song_cache_hit(chunk, annotation)

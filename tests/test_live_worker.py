@@ -1229,6 +1229,93 @@ def test_live_worker_continues_song_cache_across_progress_revision_resync(
     assert status["last_song_cache_outcome"]["track_start_rtp"] == 100
 
 
+def test_live_worker_clears_transient_missing_metadata_cache_error_after_recovery(
+    tmp_path: Path,
+) -> None:
+    config = LiveConfig(
+        sample_rate=10,
+        window_seconds=8,
+        hop_seconds=2,
+        stable_offset_seconds=0,
+    )
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    missing_metadata = {
+        "revision": 1,
+        "metadata_revision": 0,
+        "has_progress": True,
+        "start_rtp": 100,
+        "current_rtp": 100,
+        "end_rtp": 140,
+        "anchor_stream_frame": 0,
+        "track_position_frame": 0,
+        "track_duration_frame": 40,
+        "title": "",
+        "artist": "",
+        "album": "",
+    }
+    recovered_metadata = {
+        **missing_metadata,
+        "revision": 2,
+        "metadata_revision": 1,
+        "current_rtp": 120,
+        "anchor_stream_frame": 20,
+        "track_position_frame": 20,
+        "title": "Recovered Song",
+        "artist": "Artist",
+        "album": "Album",
+    }
+    for sequence, stream_start, track, anchors in (
+        (1, 0, missing_metadata, [missing_metadata]),
+        (2, 20, recovered_metadata, [missing_metadata, recovered_metadata]),
+    ):
+        capture = inbox / f"capture-{sequence:08d}.wav"
+        _write_pcm(capture, _unique_pcm(range(stream_start, stream_start + 80)))
+        capture.with_suffix(".json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "source": "airplay",
+                    "sequence": sequence,
+                    "sample_rate": 10,
+                    "stream_start_frame": stream_start,
+                    "stream_end_frame": stream_start + 80,
+                    "track": track,
+                    "anchors": anchors,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    class CopySeparator:
+        def separate(self, source: Path) -> list[Path]:
+            with wave.open(str(source), "rb") as audio:
+                pcm = audio.readframes(audio.getnframes())
+            outputs = []
+            for stem in ("Vocals", "Drums", "Bass", "Guitar", "Piano", "Other"):
+                output = tmp_path / "work" / f"metadata_({stem}).wav"
+                output.parent.mkdir(exist_ok=True)
+                _write_pcm(output, pcm)
+                outputs.append(output)
+            return outputs
+
+    worker = LiveWorker(tmp_path, separator_factory=lambda _profile: CopySeparator())
+    worker.config = config
+
+    first = worker.process_available(max_chunks=1)
+    assert [result.sequence for result in first] == [1]
+    assert worker._last_cache_error == "歌曲缓存至少需要标题或艺术家。"
+
+    second = worker.process_available(max_chunks=1)
+    worker._write_status({})
+    recovered_status = json.loads(
+        (tmp_path / "gpu-status.json").read_text(encoding="utf-8")
+    )
+    assert [result.sequence for result in second] == [2]
+    assert recovered_status["song_builder_frame_count"] > 0
+    assert worker._last_cache_error is None
+
+
 def test_live_worker_completes_song_cache_when_track_ends_mid_hop(
     tmp_path: Path,
 ) -> None:

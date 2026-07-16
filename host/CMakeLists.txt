@@ -8,10 +8,12 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 add_library(stem_host_core STATIC
     src/airplay_track_state.cpp
+    src/airplay_stream_state.cpp
     src/atomic_file.cpp
     src/audio_level_meter.cpp
     src/audio_window_buffer.cpp
     src/center_suppressor.cpp
+    src/device_audio_protocol.cpp
     src/live_paths.cpp
     src/mixer_control.cpp
     src/pcm_window_publisher.cpp
@@ -76,10 +78,20 @@ target_link_libraries(airplay_track_state_tests PRIVATE stem_host_core)
 target_compile_options(airplay_track_state_tests PRIVATE /W4 /permissive- /EHsc)
 add_test(NAME airplay_track_state_tests COMMAND airplay_track_state_tests)
 
+add_executable(airplay_stream_state_tests tests/airplay_stream_state_tests.cpp)
+target_link_libraries(airplay_stream_state_tests PRIVATE stem_host_core)
+target_compile_options(airplay_stream_state_tests PRIVATE /W4 /permissive- /EHsc)
+add_test(NAME airplay_stream_state_tests COMMAND airplay_stream_state_tests)
+
 add_executable(wasapi_recovery_policy_tests tests/wasapi_recovery_policy_tests.cpp)
 target_link_libraries(wasapi_recovery_policy_tests PRIVATE stem_host_core)
 target_compile_options(wasapi_recovery_policy_tests PRIVATE /W4 /permissive- /EHsc)
 add_test(NAME wasapi_recovery_policy_tests COMMAND wasapi_recovery_policy_tests)
+
+add_executable(device_audio_protocol_tests tests/device_audio_protocol_tests.cpp)
+target_link_libraries(device_audio_protocol_tests PRIVATE stem_host_core)
+target_compile_options(device_audio_protocol_tests PRIVATE /W4 /permissive- /EHsc)
+add_test(NAME device_audio_protocol_tests COMMAND device_audio_protocol_tests)
 
 add_executable(stem_host_tone_player tests/tone_player.cpp)
 target_link_libraries(stem_host_tone_player PRIVATE winmm)

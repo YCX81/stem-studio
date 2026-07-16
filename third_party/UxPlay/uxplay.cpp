@@ -38,6 +38,7 @@
 #include <chrono>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 
@@ -72,6 +73,7 @@
 #include "renderers/video_renderer.h"
 #include "renderers/audio_renderer.h"
 #include "airplay_track_state.h"
+#include "airplay_stream_state.h"
 #include "audio_level_meter.h"
 #include "pcm_window_publisher.h"
 #include "renderers/mux_renderer.h"
@@ -125,6 +127,7 @@ static std::unique_ptr<stemstudio::PcmWindowPublisher> stem_pcm_publisher;
 static stemstudio::AirPlayTrackState stem_track_state;
 static std::chrono::steady_clock::time_point stem_last_status_write{};
 static uint64_t stem_last_published_windows = 0;
+static std::mutex stem_status_mutex;
 #if __APPLE__
 static bool new_window_closing_behavior = false;
 #else
@@ -186,6 +189,7 @@ static void write_stem_status(
     if (stem_live_dir.empty()) {
         return;
     }
+    const std::scoped_lock status_lock(stem_status_mutex);
     const std::filesystem::path destination =
         std::filesystem::path(stem_live_dir) / "airplay-status.json";
     const auto track = stem_track_state.snapshot();
@@ -252,7 +256,12 @@ static void stem_pcm_process(
             now - stem_last_status_write >= std::chrono::milliseconds(500)) {
             const char *codec = compression_type == 2 ? "ALAC" :
                                 compression_type == 8 ? "AAC-ELD" : "PCM";
-            write_stem_status("streaming", codec, stats, &levels);
+            write_stem_status(
+                stemstudio::airplay_state_for_event(
+                    stemstudio::AirPlayStreamEvent::pcm_received, open_connections).data(),
+                codec,
+                stats,
+                &levels);
             stem_last_status_write = now;
             stem_last_published_windows = stats.published_windows;
         }
@@ -2354,6 +2363,14 @@ extern "C" void export_dacp(void *cls, const char *active_remote, const char *da
 extern "C" void conn_init (void *cls) {
     open_connections++;
     LOGD("Open connections: %i", open_connections);
+    if (stem_pcm_publisher) {
+        write_stem_status(
+            stemstudio::airplay_state_for_event(
+                stemstudio::AirPlayStreamEvent::connection_opened,
+                open_connections).data(),
+            "none",
+            stem_pcm_publisher->stats());
+    }
     //video_renderer_update_background(1);
 }
 
@@ -2361,6 +2378,14 @@ extern "C" void conn_destroy (void *cls) {
     //video_renderer_update_background(-1);
     open_connections--;
     LOGD("Open connections: %i", open_connections);
+    if (stem_pcm_publisher) {
+        write_stem_status(
+            stemstudio::airplay_state_for_event(
+                stemstudio::AirPlayStreamEvent::connection_closed,
+                open_connections).data(),
+            "none",
+            stem_pcm_publisher->stats());
+    }
     if (open_connections == 0) {
         remote_clock_offset = 0;
         if (use_audio) {
@@ -2381,6 +2406,14 @@ extern "C" void conn_feedback (void *cls) {
 }
 
 extern "C" void conn_reset (void *cls, int reason) {
+    if (stem_pcm_publisher) {
+        write_stem_status(
+            stemstudio::airplay_state_for_event(
+                stemstudio::AirPlayStreamEvent::connection_reset,
+                open_connections).data(),
+            "none",
+            stem_pcm_publisher->stats());
+    }
     switch (reason) {
     case 1:
         LOGI("*** ERROR lost connection with client (network problem?)");
@@ -2505,6 +2538,14 @@ extern "C" void video_resume (void *cls) {
 
 
 extern "C" void audio_flush (void *cls) {
+    if (stem_pcm_publisher) {
+        write_stem_status(
+            stemstudio::airplay_state_for_event(
+                stemstudio::AirPlayStreamEvent::flush_received,
+                open_connections).data(),
+            "none",
+            stem_pcm_publisher->stats());
+    }
     if (use_audio) {
         audio_renderer_flush();
     }
@@ -3283,7 +3324,11 @@ int main (int argc, char *argv[]) {
             0,
             stem_capture_annotation);
         audio_renderer_set_pcm_callback(stem_pcm_process, NULL);
-        write_stem_status("waiting", "none", stem_pcm_publisher->stats());
+        write_stem_status(
+            stemstudio::airplay_state_for_event(
+                stemstudio::AirPlayStreamEvent::receiver_started, open_connections).data(),
+            "none",
+            stem_pcm_publisher->stats());
         LOGI("Stem Studio PCM direct output enabled: %s", stem_live_dir.c_str());
     }
 
@@ -3425,7 +3470,11 @@ int main (int argc, char *argv[]) {
 static void cleanup() {
     if (stem_pcm_publisher) {
         const auto stats = stem_pcm_publisher->stats();
-        write_stem_status("stopped", "none", stats);
+        write_stem_status(
+            stemstudio::airplay_state_for_event(
+                stemstudio::AirPlayStreamEvent::receiver_stopped, open_connections).data(),
+            "none",
+            stats);
     }
     if (use_audio) {
         audio_renderer_destroy();

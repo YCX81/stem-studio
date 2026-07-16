@@ -89,6 +89,9 @@ docker compose logs -f app
 - Windows 控制器每约 2 秒写入独立心跳；活动会话超过 6 秒未刷新时，界面会明确标记控制器离线，避免把过期的“等待/播放”状态当成真实在线。启动脚本会先确认 Docker 引擎及容器启动成功，再轮换现有控制器与原生宿主，构建失败不会先拆掉仍可用的音频链。
 - 本地缓存默认总上限为 20 GiB：约 15 GiB 留给连续歌曲、5 GiB 留给无曲目时间轴时的精确窗口缓存，并按最近使用顺序清理。PCM16 立体声三分钟歌曲约占：二轨（原声+2轨）95 MiB、四轨约159 MiB、六轨约222 MiB。
 - 内置宿主将解码 PCM 与原子时间轴侧车写入 `data/live/inbox`，Docker GPU worker 只读取完整窗口；手机不连接 Docker，也不使用额外 UDP 端口。
+- AirPlay 会话的接入、PCM、flush、网络重置和关闭事件会分别发布 `connected`、`streaming`、`paused`、`recovering` 和 `waiting`，避免会话断开后继续显示过期的 `streaming`。
+
+黄山派网络播放器采用“桌面混合、设备控制与立体声播放”的 v1 架构。仓库已提供无动态分配的 PCM/控制包编解码核心；完整线格式、带宽、轨位掩码、抖动缓冲和扩展板职责见 [设备音频协议 v1](docs/device-audio-protocol-v1.md)。Windows 异步发送器与目标板固件尚未接入，因此当前不能把协议测试等同于真机无卡顿验收。
 
 真机产品验收可运行 `python tools/monitor_live_acceptance.py --timeout-seconds 1800`。监视器要求手机完整首播产生 GPU 窗口和整曲缓存、同曲重播命中歌曲缓存、播放期间欠载/声卡重连/分轨跳窗全部保持为零，并在真实音频播放时至少收到一次不高于 50 ms 的滑杆更新；外部监视结果会持续原子写入 `data/live/acceptance-monitor-report.json`，不会再与桌面端内置的 `data/live/acceptance-report.json` 争用临时文件或相互覆盖。同一项目只能有一份外部监视器持有 OS 独占锁，重复启动会返回 `already_running` 和现有 PID，异常退出后锁会由操作系统自动释放。暂停或断流阶段的队列自然排空、端点变化和历史跳窗不会污染下一次活跃播放段的验收基线。
 

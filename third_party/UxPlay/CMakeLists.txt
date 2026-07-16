@@ -78,6 +78,7 @@ endif()
 add_executable( uxplay
   uxplay.cpp
   ../../host/src/airplay_track_state.cpp
+  ../../host/src/airplay_stream_state.cpp
   ../../host/src/audio_level_meter.cpp
   ../../host/src/audio_window_buffer.cpp
   ../../host/src/live_paths.cpp

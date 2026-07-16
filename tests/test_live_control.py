@@ -626,6 +626,91 @@ def test_live_dashboard_exposes_escaped_airplay_track_and_progress(tmp_path: Pat
     assert "Song <Live>" not in dashboard
 
 
+def test_live_dashboard_synchronizes_cached_lyrics_to_airplay_position(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "airplay-status.json").write_text(
+        json.dumps(
+            {
+                "state": "streaming",
+                "track": {
+                    "revision": 7,
+                    "title": "Song",
+                    "artist": "Artist",
+                    "position_seconds": 3.6,
+                    "duration_seconds": 120,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "lyrics-status.json").write_text(
+        json.dumps(
+            {
+                "state": "ready",
+                "source": "cache",
+                "track": {"revision": 7, "title": "Song", "artist": "Artist"},
+                "lines": [
+                    {"time_seconds": 1.0, "text": "First"},
+                    {"time_seconds": 3.5, "text": "Current <line>"},
+                    {"time_seconds": 8.0, "text": "Next & line"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    snapshot = live_pipeline_snapshot(tmp_path)
+
+    assert snapshot["lyrics_state"] == "ready"
+    assert snapshot["lyrics_source"] == "cache"
+    assert snapshot["lyrics_current"] == "Current <line>"
+    assert snapshot["lyrics_previous"] == ["First"]
+    assert snapshot["lyrics_upcoming"] == ["Next & line"]
+    dashboard = live_dashboard_html(tmp_path)
+    assert "同步歌词 · 本地缓存" in dashboard
+    assert "Current &lt;line&gt;" in dashboard
+    assert "Next &amp; line" in dashboard
+    assert "stem-lyrics-current" in dashboard
+
+
+def test_live_dashboard_never_reuses_stale_lyrics_after_track_revision_changes(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "airplay-status.json").write_text(
+        json.dumps(
+            {
+                "state": "streaming",
+                "track": {
+                    "revision": 8,
+                    "title": "New Song",
+                    "artist": "Artist",
+                    "position_seconds": 2,
+                    "duration_seconds": 100,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "lyrics-status.json").write_text(
+        json.dumps(
+            {
+                "state": "ready",
+                "source": "cache",
+                "track": {"revision": 7, "title": "Old Song", "artist": "Artist"},
+                "lines": [{"time_seconds": 1, "text": "Old lyric"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    snapshot = live_pipeline_snapshot(tmp_path)
+
+    assert snapshot["lyrics_state"] == "waiting"
+    assert snapshot["lyrics_current"] == ""
+    assert "Old lyric" not in live_dashboard_html(tmp_path)
+
+
 def test_monitor_choices_follow_selected_live_profile() -> None:
     assert monitor_choices("人声 / 伴奏 · 高质量") == [
         ("人声", "vocals"),

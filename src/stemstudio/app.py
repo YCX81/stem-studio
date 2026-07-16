@@ -9,6 +9,7 @@ from .acceptance_service import start_acceptance_service
 from .core import LIVE_PROFILES, MODEL_PROFILES, SeparationRequest
 from .engine import AudioSeparatorEngine, gpu_diagnostics
 from .live_worker import start_live_worker
+from .lyrics import start_lyrics_service
 from .live_control import (
     STEM_LABELS,
     active_stem_visibility,
@@ -26,6 +27,7 @@ DATA_ROOT = Path(os.environ.get("STEM_STUDIO_DATA", "/data")).resolve()
 MODEL_DIR = DATA_ROOT / "models"
 OUTPUT_DIR = DATA_ROOT / "outputs"
 LIVE_DIR = DATA_ROOT / "live"
+LYRICS_DIR = DATA_ROOT / "lyrics"
 
 CSS = """
 .gradio-container { max-width: 1120px !important; }
@@ -345,6 +347,8 @@ def build_app() -> gr.Blocks:
                 gr.Markdown(
                     "AirPlay 接收器随实时会话自动启动。音乐投送通常为 ALAC；"
                     "屏幕镜像音频通常为 AAC-ELD，不属于无损链路。"
+                    "同步歌词按歌名、歌手、专辑和时长从 LRCLIB 查询并缓存在本地；"
+                    "只发送这些曲目信息，不发送音频。"
                 )
                 with gr.Row():
                     open_routing = gr.Button("打开 Windows 音量混合器")
@@ -433,8 +437,10 @@ def build_app() -> gr.Blocks:
 def main() -> None:
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    LYRICS_DIR.mkdir(parents=True, exist_ok=True)
     start_acceptance_service(DATA_ROOT / "live")
     start_live_worker(DATA_ROOT / "live")
+    start_lyrics_service(LIVE_DIR, LYRICS_DIR)
     app = build_app()
     app.queue(default_concurrency_limit=1).launch(
         server_name="0.0.0.0",

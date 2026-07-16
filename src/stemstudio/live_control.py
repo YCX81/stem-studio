@@ -12,6 +12,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from .core import LIVE_PROFILES
+from .lyrics import LyricLine, select_lyric_window
 
 
 STEM_LABELS = {
@@ -195,6 +196,7 @@ def live_pipeline_snapshot(live_root: str | Path) -> dict:
     stream_stalled = raw_streaming and not streaming
     gpu = _read_status(root / "gpu-status.json")
     playback = _read_status(root / "playback-status.json")
+    lyrics = _read_status(root / "lyrics-status.json")
     acceptance = _read_status(root / "acceptance-report.json")
     acceptance_states = {
         "waiting_for_phone",
@@ -360,6 +362,66 @@ def live_pipeline_snapshot(live_root: str | Path) -> dict:
             return 0.0
         return value if math.isfinite(value) and value >= 0.0 else 0.0
 
+    track_revision = max(0, int(track_number("revision")))
+    track_title = track_text("title")
+    track_artist = track_text("artist")
+    lyrics_state = "waiting"
+    lyrics_source = ""
+    lyrics_instrumental = False
+    lyrics_error = ""
+    lyrics_current = ""
+    lyrics_previous: list[str] = []
+    lyrics_upcoming: list[str] = []
+    lyrics_line_count = 0
+    lyrics_track = lyrics.get("track", {})
+    if isinstance(lyrics_track, dict):
+        try:
+            lyrics_revision = max(0, int(lyrics_track.get("revision", 0) or 0))
+        except (TypeError, ValueError):
+            lyrics_revision = -1
+        same_track = (
+            track_revision > 0
+            and lyrics_revision == track_revision
+            and str(lyrics_track.get("title", "")).strip().casefold()
+            == track_title.strip().casefold()
+            and str(lyrics_track.get("artist", "")).strip().casefold()
+            == track_artist.strip().casefold()
+        )
+        if same_track:
+            candidate_state = str(lyrics.get("state", "waiting"))
+            if candidate_state in {"ready", "not_found", "error"}:
+                lyrics_state = candidate_state
+            candidate_source = str(lyrics.get("source", ""))
+            if candidate_source in {"cache", "lrclib"}:
+                lyrics_source = candidate_source
+            lyrics_instrumental = lyrics.get("instrumental") is True
+            lyrics_error = str(lyrics.get("error", "") or "")[:512]
+
+            parsed_lines: list[LyricLine] = []
+            raw_lines = lyrics.get("lines", [])
+            if lyrics_state == "ready" and isinstance(raw_lines, list):
+                for raw_line in raw_lines[:20_000]:
+                    if not isinstance(raw_line, dict):
+                        continue
+                    try:
+                        line_time = float(raw_line.get("time_seconds", 0.0))
+                    except (TypeError, ValueError):
+                        continue
+                    line_text = str(raw_line.get("text", "") or "").strip()[:4096]
+                    if math.isfinite(line_time) and line_time >= 0.0 and line_text:
+                        parsed_lines.append(LyricLine(line_time, line_text))
+                parsed_lines.sort(key=lambda line: line.time_seconds)
+                lyrics_line_count = len(parsed_lines)
+                selection = select_lyric_window(
+                    parsed_lines,
+                    track_number("position_seconds"),
+                    context=2,
+                )
+                if selection.current is not None:
+                    lyrics_current = selection.current.text
+                lyrics_previous = [line.text for line in selection.previous]
+                lyrics_upcoming = [line.text for line in selection.upcoming]
+
     return {
         "controller_state": controller_state,
         "controller_online": controller_online,
@@ -384,12 +446,20 @@ def live_pipeline_snapshot(live_root: str | Path) -> dict:
         "rms_left": level("rms_left"),
         "rms_right": level("rms_right"),
         "waveform": waveform,
-        "track_revision": max(0, int(track_number("revision"))),
-        "track_title": track_text("title"),
-        "track_artist": track_text("artist"),
+        "track_revision": track_revision,
+        "track_title": track_title,
+        "track_artist": track_artist,
         "track_album": track_text("album"),
         "track_position_seconds": round(track_number("position_seconds"), 3),
         "track_duration_seconds": round(track_number("duration_seconds"), 3),
+        "lyrics_state": lyrics_state,
+        "lyrics_source": lyrics_source,
+        "lyrics_instrumental": lyrics_instrumental,
+        "lyrics_error": lyrics_error,
+        "lyrics_current": lyrics_current,
+        "lyrics_previous": lyrics_previous,
+        "lyrics_upcoming": lyrics_upcoming,
+        "lyrics_line_count": lyrics_line_count,
         "captured_sequence": captured_sequence,
         "gpu_sequence": gpu_sequence,
         "playback_sequence": playback_sequence,
@@ -697,6 +767,31 @@ def live_dashboard_html(live_root: str | Path) -> str:
         if duration > 0.0
         else "进度待同步"
     )
+    lyrics_source_labels = {"cache": "本地缓存", "lrclib": "LRCLIB"}
+    lyrics_source = lyrics_source_labels.get(snapshot["lyrics_source"], "等待匹配")
+    if snapshot["lyrics_state"] == "ready" and snapshot["lyrics_instrumental"]:
+        lyrics_body = '<div class="stem-lyrics-empty">纯音乐 · 无需同步歌词</div>'
+    elif snapshot["lyrics_state"] == "ready":
+        previous_lines = "".join(
+            f'<div class="stem-lyrics-context">{html.escape(line)}</div>'
+            for line in snapshot["lyrics_previous"]
+        )
+        current_line = html.escape(snapshot["lyrics_current"] or "等待第一句…")
+        upcoming_lines = "".join(
+            f'<div class="stem-lyrics-context">{html.escape(line)}</div>'
+            for line in snapshot["lyrics_upcoming"]
+        )
+        lyrics_body = (
+            f"{previous_lines}"
+            f'<div class="stem-lyrics-current">{current_line}</div>'
+            f"{upcoming_lines}"
+        )
+    elif snapshot["lyrics_state"] == "not_found":
+        lyrics_body = '<div class="stem-lyrics-empty">未找到这首歌的同步歌词</div>'
+    elif snapshot["lyrics_state"] == "error":
+        lyrics_body = '<div class="stem-lyrics-empty">歌词服务暂不可用，将在稍后重试</div>'
+    else:
+        lyrics_body = '<div class="stem-lyrics-empty">等待曲目信息与同步歌词…</div>'
     acceptance_labels = {
         "waiting_for_phone": "等待手机",
         "in_progress": "进行中",
@@ -755,6 +850,11 @@ def live_dashboard_html(live_root: str | Path) -> str:
     .stem-track b{{display:block;font-size:14px}} .stem-track small{{color:#8e99ad!important}} .stem-track time{{white-space:nowrap;color:#a5b4fc!important;font-size:12px}}
     .stem-wave{{height:92px;display:flex;align-items:center;gap:3px;background:#0a0c11;border-radius:10px;padding:10px;overflow:hidden}}
     .stem-wave i{{display:block;flex:1;min-width:2px;max-height:100%;border-radius:3px;background:linear-gradient(180deg,#67e8f9,#8b5cf6);opacity:.9}}
+    .stem-lyrics{{margin-top:12px;background:#171b24;border-radius:12px;padding:13px;text-align:center;min-height:96px}}
+    .stem-lyrics h4{{font-size:12px;color:#aab3c5!important;margin:0 0 10px;text-align:left}}
+    .stem-lyrics-context{{color:#7d879a!important;font-size:12px;line-height:1.7;white-space:pre-wrap}}
+    .stem-lyrics-current{{color:#eef2ff!important;font-size:18px;font-weight:700;line-height:1.6;margin:3px 0;white-space:pre-wrap}}
+    .stem-lyrics-empty{{color:#8e99ad!important;font-size:13px;padding:18px 0}}
     .stem-grid{{display:grid;grid-template-columns:1.2fr 1fr;gap:14px;margin-top:14px}} .stem-card{{background:#171b24;border-radius:12px;padding:13px}}
     .stem-card h4{{font-size:12px;color:#aab3c5!important;margin:0 0 10px}} .meter{{color:#eef2ff!important;display:grid;grid-template-columns:14px 1fr 38px;gap:8px;align-items:center;margin:7px 0;font-size:12px}}
     .meter span{{height:8px;background:#2b3140;border-radius:8px;overflow:hidden}} .meter b{{display:block;height:100%;background:#22d3ee;border-radius:8px}} .meter em{{font-style:normal;color:#aab3c5!important;text-align:right}}
@@ -767,6 +867,7 @@ def live_dashboard_html(live_root: str | Path) -> str:
   <div class="stem-head"><strong>实时输入电平</strong><span class="stem-chip {state_class}">{state_text} · {html.escape(snapshot['codec'])}</span></div>
   <div class="stem-track"><div><b>{title}</b><small>{track_details or '内容指纹将在收到音频后确认'}</small></div><time>{progress}</time></div>
   <div class="stem-wave">{bars}</div>
+  <div class="stem-lyrics"><h4>同步歌词 · {lyrics_source}</h4>{lyrics_body}</div>
   <div class="stem-grid">
     <div class="stem-card">
       <h4>立体声电平</h4>

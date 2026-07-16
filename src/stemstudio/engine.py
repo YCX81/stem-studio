@@ -11,10 +11,14 @@ class AudioSeparatorEngine:
         self,
         model_dir: str | Path,
         separator_factory: Callable[..., Any] | None = None,
+        mdxc_segment_size: int = 256,
     ) -> None:
+        if mdxc_segment_size < 64:
+            raise ValueError("MDXC 分片大小至少为 64。")
         self.model_dir = Path(model_dir).expanduser().resolve()
         self.model_dir.mkdir(parents=True, exist_ok=True)
         self._separator_factory = separator_factory
+        self.mdxc_segment_size = int(mdxc_segment_size)
 
     def _factory(self) -> Callable[..., Any]:
         if self._separator_factory is None:
@@ -30,7 +34,7 @@ class AudioSeparatorEngine:
             output_format=request.output_format,
             use_autocast=True,
             mdxc_params={
-                "segment_size": 256,
+                "segment_size": self.mdxc_segment_size,
                 "override_model_segment_size": False,
                 "batch_size": 1,
                 "overlap": 8,

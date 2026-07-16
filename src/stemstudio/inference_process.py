@@ -67,24 +67,66 @@ def _warm_up_separator(
                 candidate.unlink(missing_ok=True)
 
 
-def _persistent_separator_worker(connection: Connection, config: dict) -> None:
-    separator = None
-    try:
-        from .live import PersistentSeparator
+def _prepare_persistent_separator(
+    config: dict[str, Any],
+    *,
+    separator_factory: Callable[..., Any],
+    warm_up: Callable[..., float] = _warm_up_separator,
+) -> tuple[Any, dict[str, object]]:
+    """Warm a model and retain shifts=2 only when its hot pass fits the hop budget."""
+    requested_shifts = int(config.get("demucs_shifts", 1))
+    benchmark_limit = float(config.get("shifts_benchmark_limit_seconds", 2.4))
 
-        separator = PersistentSeparator(
+    def create(shifts: int) -> Any:
+        return separator_factory(
             model_dir=config["model_dir"],
             work_dir=config["work_dir"],
             model_filename=config["model_filename"],
+            demucs_shifts=shifts,
         )
-        warmup_seconds = _warm_up_separator(
-            separator,
+
+    def exercise(candidate: Any) -> float:
+        return warm_up(
+            candidate,
             config["work_dir"],
             sample_rate=int(config.get("sample_rate", 44_100)),
             channels=int(config.get("channels", 2)),
             window_seconds=int(config.get("window_seconds", 12)),
         )
-        connection.send({"kind": "ready", "warmup_seconds": warmup_seconds})
+
+    separator = create(requested_shifts)
+    warmup_seconds = exercise(separator)
+    benchmark_seconds: float | None = None
+    fallback = False
+    effective_shifts = requested_shifts
+    if requested_shifts == 2:
+        benchmark_seconds = exercise(separator)
+        if benchmark_seconds > benchmark_limit:
+            separator.close()
+            separator = create(1)
+            warmup_seconds = exercise(separator)
+            effective_shifts = 1
+            fallback = True
+    return separator, {
+        "warmup_seconds": warmup_seconds,
+        "requested_demucs_shifts": requested_shifts,
+        "effective_demucs_shifts": effective_shifts,
+        "shifts_benchmark_seconds": benchmark_seconds,
+        "shifts_benchmark_limit_seconds": benchmark_limit,
+        "shifts_fallback": fallback,
+    }
+
+
+def _persistent_separator_worker(connection: Connection, config: dict) -> None:
+    separator = None
+    try:
+        from .live import PersistentSeparator
+
+        separator, tuning = _prepare_persistent_separator(
+            config,
+            separator_factory=PersistentSeparator,
+        )
+        connection.send({"kind": "ready", **tuning})
         while True:
             request = connection.recv()
             kind = request.get("kind")
@@ -135,6 +177,9 @@ class IsolatedPersistentSeparator:
         model_filename: str,
         inference_timeout_seconds: float,
         *,
+        demucs_shifts: int = 1,
+        shifts_benchmark_limit_seconds: float = 2.4,
+        window_seconds: int = 12,
         child_target: Callable[[Connection, dict], None] = _persistent_separator_worker,
         child_config: dict[str, Any] | None = None,
         process_context: Any | None = None,
@@ -149,6 +194,13 @@ class IsolatedPersistentSeparator:
         self._closed = False
         self._request_id = 0
         self._model_warmup_seconds: float | None = None
+        self._tuning_status: dict[str, object] = {
+            "requested_demucs_shifts": demucs_shifts,
+            "effective_demucs_shifts": None,
+            "shifts_benchmark_seconds": None,
+            "shifts_benchmark_limit_seconds": shifts_benchmark_limit_seconds,
+            "shifts_fallback": False,
+        }
         self._inference_error: str | None = None
         context = process_context or multiprocessing.get_context("spawn")
         parent_connection, child_connection = context.Pipe(duplex=True)
@@ -159,7 +211,9 @@ class IsolatedPersistentSeparator:
                 "model_filename": model_filename,
                 "sample_rate": 44_100,
                 "channels": 2,
-                "window_seconds": 12,
+                "window_seconds": window_seconds,
+                "demucs_shifts": demucs_shifts,
+                "shifts_benchmark_limit_seconds": shifts_benchmark_limit_seconds,
             }
             if child_config is None
             else child_config
@@ -209,6 +263,7 @@ class IsolatedPersistentSeparator:
             "inference_timeout_seconds": self.inference_timeout_seconds,
             "model_warmup_seconds": self._model_warmup_seconds,
             "inference_error": self._inference_error,
+            **self._tuning_status,
         }
 
     def wait_until_ready(self, timeout_seconds: float = 0.0) -> bool:
@@ -233,6 +288,9 @@ class IsolatedPersistentSeparator:
                         )
                     except (TypeError, ValueError):
                         self._model_warmup_seconds = 0.0
+                    for key in self._tuning_status:
+                        if key in message:
+                            self._tuning_status[key] = message[key]
                     return True
                 if kind == "startup_error":
                     self._inference_error = (

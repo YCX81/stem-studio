@@ -528,6 +528,9 @@ def live_pipeline_snapshot(live_root: str | Path) -> dict:
         "inference_process_pid": status_count("inference_process_pid"),
         "inference_timeout_seconds": gpu_metric("inference_timeout_seconds"),
         "model_warmup_seconds": gpu_metric("model_warmup_seconds"),
+        "effective_demucs_shifts": status_count("effective_demucs_shifts"),
+        "shifts_benchmark_seconds": gpu_metric("shifts_benchmark_seconds"),
+        "shifts_fallback": gpu.get("shifts_fallback") is True,
         "warmup_windows": status_count("warmup_windows"),
         "deadline_windows": status_count("deadline_windows"),
         "low_buffer_fallback_windows": status_count("low_buffer_fallback_windows"),
@@ -767,10 +770,18 @@ def live_dashboard_html(live_root: str | Path) -> str:
         if snapshot["model_warmup_seconds"] > 0.0
         else "等待完整预热"
     )
+    tuning_text = (
+        f" · shifts={snapshot['effective_demucs_shifts']}"
+        f" · 热推理 {snapshot['shifts_benchmark_seconds']:.2f} 秒"
+        + ("（已自动回退）" if snapshot["shifts_fallback"] else "")
+        if snapshot["effective_demucs_shifts"]
+        else ""
+    )
     model_text = (
         f"{model_labels[snapshot['model_state']]} · {process_text}"
         f" · 硬截止 {snapshot['inference_timeout_seconds']:g} 秒"
         f" · {warmup_text}"
+        f"{tuning_text}"
         f" · 预热保底 {snapshot['warmup_windows']} 窗"
         f" · 超时保底 {snapshot['deadline_windows']} 窗"
         f" · 低余量保底 {snapshot['low_buffer_fallback_windows']} 窗"
@@ -1089,12 +1100,15 @@ def write_command(
     monitor_stem: str = "instrumental",
     profile_name: str = "人声 / 伴奏 · 高质量",
     device_endpoint: str = "",
+    hop_seconds: int | None = None,
 ) -> int:
     if action not in {"start", "start_airplay", "stop", "open_audio_settings"}:
         raise ValueError("未知实时控制命令。")
     if action == "start" and (process_id is None or int(process_id) <= 0):
         raise ValueError("请先选择有效的音乐软件。")
     if action in {"start", "start_airplay"}:
+        if hop_seconds is not None and hop_seconds not in {3, 6}:
+            raise ValueError("实时步进仅支持 3 秒或 6 秒。")
         if profile_name not in LIVE_PROFILES:
             raise ValueError("未知实时分离模式。")
         profile = LIVE_PROFILES[profile_name]
@@ -1109,6 +1123,8 @@ def write_command(
         payload["monitor_stem"] = monitor_stem
         payload["profile_name"] = profile_name
         payload["track_count"] = len(profile.stems)
+        if hop_seconds is not None:
+            payload["hop_seconds"] = hop_seconds
         normalized_device_endpoint = _normalize_device_endpoint(device_endpoint)
         if normalized_device_endpoint:
             payload["device_endpoint"] = normalized_device_endpoint

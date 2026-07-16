@@ -191,7 +191,10 @@ def test_persistent_separator_loads_model_only_once(tmp_path: Path) -> None:
     assert [path.name for path in second] == ["Vocals.wav", "Instrumental.wav"]
 
 
-def test_persistent_separator_configures_single_shift_demucs_for_live(tmp_path: Path) -> None:
+@pytest.mark.parametrize("shifts", [1, 2])
+def test_persistent_separator_configures_requested_demucs_shifts_for_live(
+    tmp_path: Path, shifts: int
+) -> None:
     captured = {}
 
     class FakeSeparator:
@@ -205,11 +208,23 @@ def test_persistent_separator_configures_single_shift_demucs_for_live(tmp_path: 
         model_dir=tmp_path / "models",
         work_dir=tmp_path / "work",
         model_filename="htdemucs_6s.yaml",
+        demucs_shifts=shifts,
         separator_factory=FakeSeparator,
     )
 
-    assert captured["demucs_params"]["shifts"] == 1
+    assert captured["demucs_params"]["shifts"] == shifts
     assert captured["demucs_params"]["overlap"] == 0.25
+
+
+def test_persistent_separator_rejects_unsupported_live_shifts(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="shifts"):
+        PersistentSeparator(
+            model_dir=tmp_path / "models",
+            work_dir=tmp_path / "work",
+            model_filename="htdemucs_6s.yaml",
+            demucs_shifts=3,
+            separator_factory=lambda **_kwargs: None,
+        )
 
 
 def test_persistent_separator_keeps_demucs_network_resident_between_windows(

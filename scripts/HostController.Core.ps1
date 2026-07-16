@@ -5,7 +5,9 @@ function Get-AirPlayStartPlan {
         [AllowEmptyString()][string]$CurrentProfile,
         [Parameter(Mandatory = $true)][string]$RequestedProfile,
         [AllowEmptyString()][string]$CurrentDeviceEndpoint = '',
-        [AllowEmptyString()][string]$RequestedDeviceEndpoint = ''
+        [AllowEmptyString()][string]$RequestedDeviceEndpoint = '',
+        [int]$CurrentHopSeconds = 6,
+        [int]$RequestedHopSeconds = 6
     )
 
     $restartAirPlay = -not $AirPlayRunning
@@ -14,7 +16,8 @@ function Get-AirPlayStartPlan {
         RestartPlayback = $restartAirPlay -or
             -not $PlaybackRunning -or
             $CurrentProfile -ne $RequestedProfile -or
-            $CurrentDeviceEndpoint -ne $RequestedDeviceEndpoint
+            $CurrentDeviceEndpoint -ne $RequestedDeviceEndpoint -or
+            $CurrentHopSeconds -ne $RequestedHopSeconds
     }
 }
 
@@ -53,12 +56,22 @@ function Assert-LiveTrackCount {
     return $TrackCount
 }
 
+function Assert-LiveHopSeconds {
+    param([Parameter(Mandatory = $true)][int]$HopSeconds)
+
+    if ($HopSeconds -notin @(3, 6)) {
+        throw "Unsupported live hop: $HopSeconds"
+    }
+    return $HopSeconds
+}
+
 function New-AudioHostArgumentList {
     param(
         [Parameter(Mandatory = $true)][string]$Source,
         [Parameter(Mandatory = $true)][string]$LiveDirectory,
         [Parameter(Mandatory = $true)][int]$TrackCount,
-        [AllowEmptyString()][string]$DeviceEndpoint = ''
+        [AllowEmptyString()][string]$DeviceEndpoint = '',
+        [int]$HopSeconds = 6
     )
 
     $arguments = @($Source, $LiveDirectory, (Assert-LiveTrackCount $TrackCount))
@@ -66,6 +79,7 @@ function New-AudioHostArgumentList {
     if ($validatedEndpoint) {
         $arguments += $validatedEndpoint
     }
+    $arguments += @('--hop-seconds', (Assert-LiveHopSeconds $HopSeconds))
     return $arguments
 }
 

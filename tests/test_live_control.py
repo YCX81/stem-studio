@@ -888,6 +888,15 @@ def test_write_command_validates_and_publishes_device_endpoint(tmp_path: Path) -
             write_command(tmp_path, "start_airplay", device_endpoint=invalid)
 
 
+def test_write_command_publishes_validated_realtime_hop(tmp_path: Path) -> None:
+    write_command(tmp_path, "start_airplay", hop_seconds=3)
+    payload = json.loads((tmp_path / "command.json").read_text(encoding="utf-8"))
+    assert payload["hop_seconds"] == 3
+
+    with pytest.raises(ValueError, match="3 秒或 6 秒"):
+        write_command(tmp_path, "start_airplay", hop_seconds=4)
+
+
 def test_live_dashboard_exposes_device_network_queue_and_errors(tmp_path: Path) -> None:
     (tmp_path / "playback-status.json").write_text(
         json.dumps(

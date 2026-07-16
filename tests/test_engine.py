@@ -30,7 +30,9 @@ def test_engine_configures_cache_gpu_autocast_and_returns_files(tmp_path: Path) 
         source, "人声 / 伴奏 · 高质量", "FLAC", tmp_path / "outputs"
     )
     engine = AudioSeparatorEngine(
-        model_dir=tmp_path / "models", separator_factory=FakeSeparator
+        model_dir=tmp_path / "models",
+        separator_factory=FakeSeparator,
+        mdxc_segment_size=384,
     )
 
     results = engine.separate(request)
@@ -40,6 +42,7 @@ def test_engine_configures_cache_gpu_autocast_and_returns_files(tmp_path: Path) 
     assert FakeSeparator.init_kwargs["output_format"] == "FLAC"
     assert FakeSeparator.init_kwargs["use_autocast"] is True
     assert FakeSeparator.init_kwargs["mdxc_params"]["batch_size"] == 1
+    assert FakeSeparator.init_kwargs["mdxc_params"]["segment_size"] == 384
     assert FakeSeparator.init_kwargs["demucs_params"]["segment_size"] == "Default"
     assert FakeSeparator.loaded_model == request.model_filename
     assert len(results) == 1 and results[0].exists()

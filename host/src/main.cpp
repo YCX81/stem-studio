@@ -77,6 +77,12 @@ int fail_hresult(const char* operation, const HRESULT result) {
     throw std::invalid_argument("track profile must be 2, 4, or 6");
 }
 
+[[nodiscard]] std::uint32_t parse_hop_seconds(const std::wstring_view value) {
+    if (value == L"3") return 3;
+    if (value == L"6") return 6;
+    throw std::invalid_argument("live hop must be 3 or 6 seconds");
+}
+
 [[nodiscard]] std::string json_escape(const std::string_view value) {
     std::string escaped;
     escaped.reserve(value.size());
@@ -247,9 +253,10 @@ void write_playback_status(
 }  // namespace
 
 int wmain(const int argc, wchar_t* argv[]) {
-    if (argc < 3 || argc > 5) {
+    if (argc < 3 || argc > 7) {
         std::wcerr << L"Usage: stem-studio-audio-host <process-id|--playback-only> "
-                      L"<live-data-directory> [2|4|6] [device-ipv4:udp-port]\n";
+                      L"<live-data-directory> [2|4|6] [device-ipv4:udp-port] "
+                      L"[--hop-seconds 3|6]\n";
         return 2;
     }
 
@@ -266,6 +273,19 @@ int wmain(const int argc, wchar_t* argv[]) {
 
     try {
         const auto track_count = parse_track_count(argc >= 4 ? std::wstring_view{argv[3]} : L"2");
+        std::optional<std::wstring_view> device_endpoint;
+        std::uint32_t hop_seconds = 6;
+        for (int index = 4; index < argc; ++index) {
+            const std::wstring_view argument{argv[index]};
+            if (argument == L"--hop-seconds") {
+                if (++index >= argc) throw std::invalid_argument("--hop-seconds requires a value");
+                hop_seconds = parse_hop_seconds(argv[index]);
+            } else if (!device_endpoint.has_value()) {
+                device_endpoint = argument;
+            } else {
+                throw std::invalid_argument("unknown audio host argument");
+            }
+        }
         const auto active_stems = stemstudio::stems_for_profile(track_count);
         const auto live_root = std::filesystem::absolute(argv[2]);
         const auto inbox = live_root / L"inbox";
@@ -277,7 +297,9 @@ int wmain(const int argc, wchar_t* argv[]) {
         if (FAILED(com.result())) return fail_hresult("CoInitializeEx", com.result());
         SetConsoleCtrlHandler(handle_console, TRUE);
 
-        const stemstudio::AudioGeometry geometry{};
+        auto geometry = stemstudio::AudioGeometry{};
+        geometry.hop_seconds = hop_seconds;
+        geometry.validate();
         const auto initial_sequence = stemstudio::next_capture_sequence(inbox, outbox);
         const auto window_frames = static_cast<std::size_t>(geometry.sample_rate) * geometry.window_seconds;
         const auto hop_frames = static_cast<std::size_t>(geometry.sample_rate) * geometry.hop_seconds;
@@ -291,8 +313,8 @@ int wmain(const int argc, wchar_t* argv[]) {
         };
         std::unique_ptr<stemstudio::DeviceAudioPacketQueue> device_queue;
         std::unique_ptr<stemstudio::DeviceUdpSender> device_sender;
-        if (argc == 5) {
-            const auto endpoint = stemstudio::parse_device_udp_endpoint(argv[4]);
+        if (device_endpoint.has_value()) {
+            const auto endpoint = stemstudio::parse_device_udp_endpoint(*device_endpoint);
             const auto session_id = static_cast<std::uint32_t>(
                 current_system_time_nanoseconds() ^ static_cast<std::uint64_t>(GetCurrentProcessId()));
             constexpr std::size_t device_queue_capacity_packets = 128;

@@ -36,6 +36,16 @@ $changedDevice = Get-AirPlayStartPlan `
 Assert-Equal $false $changedDevice.RestartAirPlay 'Changing device endpoint must preserve AirPlay'
 Assert-Equal $true $changedDevice.RestartPlayback 'Changing device endpoint must restart playback only'
 
+$changedHop = Get-AirPlayStartPlan `
+    -AirPlayRunning $true `
+    -PlaybackRunning $true `
+    -CurrentProfile 'profile-two-track' `
+    -RequestedProfile 'profile-two-track' `
+    -CurrentHopSeconds 6 `
+    -RequestedHopSeconds 3
+Assert-Equal $false $changedHop.RestartAirPlay 'Changing hop must preserve AirPlay'
+Assert-Equal $true $changedHop.RestartPlayback 'Changing hop must restart playback only'
+
 $coldStart = Get-AirPlayStartPlan `
     -AirPlayRunning $false `
     -PlaybackRunning $false `
@@ -50,11 +60,13 @@ Assert-Equal 6 (Assert-LiveTrackCount 6) 'Six-track validation'
 Assert-Equal '' (Assert-DeviceAudioEndpoint '') 'Empty device endpoint disables LAN output'
 Assert-Equal '192.168.31.88:4010' (Assert-DeviceAudioEndpoint '192.168.31.88:4010') `
     'Valid IPv4 UDP endpoint'
-$playbackArgs = @(New-AudioHostArgumentList -Source '--playback-only' -LiveDirectory 'data\live' -TrackCount 6 -DeviceEndpoint '192.168.31.88:4010')
-Assert-Equal 4 $playbackArgs.Count 'LAN playback must append the device endpoint'
+$playbackArgs = @(New-AudioHostArgumentList -Source '--playback-only' -LiveDirectory 'data\live' -TrackCount 6 -DeviceEndpoint '192.168.31.88:4010' -HopSeconds 3)
+Assert-Equal 6 $playbackArgs.Count 'LAN playback must append endpoint and hop arguments'
 Assert-Equal '192.168.31.88:4010' $playbackArgs[3] 'LAN playback endpoint argument'
+Assert-Equal '--hop-seconds' $playbackArgs[4] 'LAN playback hop flag'
+Assert-Equal 3 $playbackArgs[5] 'LAN playback hop value'
 $localArgs = @(New-AudioHostArgumentList -Source '1234' -LiveDirectory 'data\live' -TrackCount 2)
-Assert-Equal 3 $localArgs.Count 'Local playback must omit an empty device endpoint'
+Assert-Equal 5 $localArgs.Count 'Local playback must omit endpoint and retain default hop'
 Assert-Equal 'AboveNormal' (Get-StreamingPriorityClass) `
     'Native streaming hosts must outrank ordinary desktop build work'
 

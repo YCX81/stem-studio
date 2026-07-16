@@ -1,13 +1,22 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
+import threading
 
 import gradio as gr
 
 from .acceptance_service import start_acceptance_service
 from .core import LIVE_PROFILES, MODEL_PROFILES, SeparationRequest
-from .engine import AudioSeparatorEngine, gpu_diagnostics
+from .engine import AudioSeparatorEngine
+from .gpu_work import GpuReservation, GpuWorkCoordinator
+from .hardware import (
+    HardwareConfig,
+    apply_hardware_config,
+    detect_hardware_config,
+    write_hardware_profile,
+)
 from .live_worker import start_live_worker
 from .lyrics import start_lyrics_service
 from .live_control import (
@@ -28,6 +37,10 @@ MODEL_DIR = DATA_ROOT / "models"
 OUTPUT_DIR = DATA_ROOT / "outputs"
 LIVE_DIR = DATA_ROOT / "live"
 LYRICS_DIR = DATA_ROOT / "lyrics"
+_HARDWARE_CONFIG: HardwareConfig | None = None
+_GPU_COORDINATOR: GpuWorkCoordinator | None = None
+_LIVE_RESERVATION: GpuReservation | None = None
+_RESERVATION_LOCK = threading.Lock()
 
 CSS = """
 .gradio-container { max-width: 1120px !important; }
@@ -38,13 +51,40 @@ CSS = """
 """
 
 
+def _hardware_config() -> HardwareConfig:
+    global _HARDWARE_CONFIG
+    if _HARDWARE_CONFIG is None:
+        _HARDWARE_CONFIG = detect_hardware_config()
+    return _HARDWARE_CONFIG
+
+
+def _gpu_coordinator() -> GpuWorkCoordinator:
+    global _GPU_COORDINATOR
+    if _GPU_COORDINATOR is None:
+        _GPU_COORDINATOR = GpuWorkCoordinator(_hardware_config().gpu_concurrency)
+    return _GPU_COORDINATOR
+
+
+def _native_live_session_active() -> bool:
+    try:
+        payload = json.loads(
+            (LIVE_DIR / "controller-status.json").read_text(encoding="utf-8-sig")
+        )
+    except (OSError, json.JSONDecodeError):
+        return False
+    return payload.get("state") in {"capturing", "airplay_waiting"}
+
+
 def _gpu_status_markdown() -> str:
-    info = gpu_diagnostics()
-    if not info.get("available"):
-        return f"🔴 **GPU 未就绪** · {info.get('error', '容器未检测到 CUDA')}"
+    config = _hardware_config()
+    if not config.available:
+        return f"🔴 **GPU 未就绪** · {config.warnings[0]}"
+    warning = f" · ⚠️ {config.warnings[0]}" if config.warnings else ""
     return (
-        f"🟢 **GPU 已就绪** · {info['device']} · {info['vram']} · "
-        f"CUDA {info['cuda']} · PyTorch {info['torch']} · 算力 {info['capability']}"
+        f"🟢 **GPU 已就绪** · {config.device_name} · {config.vram_gb:g} GB · "
+        f"{config.tier} 档 · 文件并发 {config.gpu_concurrency} · "
+        f"实时 12 秒窗/{config.live_hop_seconds} 秒步进/shifts≤{config.demucs_shifts}"
+        f"{warning}"
     )
 
 
@@ -55,14 +95,22 @@ def run_separation(
 ) -> tuple[str, list[str]]:
     if not source:
         return "请先拖入或选择一个音频文件。", []
+    reservation: GpuReservation | None = None
     try:
+        if _native_live_session_active():
+            raise RuntimeError("原生实时宿主仍在运行，请先停止实时捕获。")
+        reservation = _gpu_coordinator().reserve_file()
+        config = _hardware_config()
         request = SeparationRequest.create(
             source=source,
             profile_name=profile_name,
             output_format=output_format,
             output_root=OUTPUT_DIR,
         )
-        outputs = AudioSeparatorEngine(MODEL_DIR).separate(request)
+        outputs = AudioSeparatorEngine(
+            MODEL_DIR,
+            mdxc_segment_size=config.mdxc_segment_size,
+        ).separate(request)
         message = (
             f"✅ 分离完成：生成 {len(outputs)} 条音轨。\n\n"
             f"保存目录：`{request.output_dir}`"
@@ -70,6 +118,9 @@ def run_separation(
         return message, [str(path) for path in outputs]
     except Exception as exc:
         return f"❌ 分离失败：{exc}", []
+    finally:
+        if reservation is not None:
+            reservation.release()
 
 
 def refresh_live_processes():
@@ -170,6 +221,13 @@ def restore_live_controls():
     restored = live_ui_defaults(LIVE_DIR)
     input_source = restored["input_source"]
     profile_name = restored["profile_name"]
+    allowed_names = [
+        name
+        for name, profile in LIVE_PROFILES.items()
+        if len(profile.stems) <= max(2, _hardware_config().max_live_tracks)
+    ]
+    if profile_name not in allowed_names:
+        profile_name = allowed_names[0]
     device_endpoint = restored["device_endpoint"]
     gains = restored["gains"]
     visibility = active_stem_visibility(profile_name)
@@ -182,7 +240,7 @@ def restore_live_controls():
             value=process_value,
             visible=input_source == "process",
         ),
-        gr.Dropdown(value=profile_name),
+        gr.Dropdown(value=profile_name, choices=allowed_names),
         gr.Textbox(value=device_endpoint),
         *(
             gr.Slider(
@@ -212,7 +270,14 @@ def start_live_capture(
     piano: float,
     other: float,
 ) -> str:
+    global _LIVE_RESERVATION
+    created_reservation = False
     try:
+        with _RESERVATION_LOCK:
+            if _LIVE_RESERVATION is None:
+                _LIVE_RESERVATION = _gpu_coordinator().reserve_live()
+                created_reservation = True
+        config = _hardware_config()
         write_mixer_percentages(
             LIVE_DIR,
             profile_name,
@@ -233,11 +298,12 @@ def start_live_capture(
             monitor_stem=LIVE_PROFILES[profile_name].stems[0],
             profile_name=profile_name,
             device_endpoint=device_endpoint,
+            hop_seconds=config.live_hop_seconds,
         )
         latency = {
-            "人声 / 伴奏 · 高质量": "约 25–30 秒",
-            "四轨 · 人声/鼓/贝斯/其他": "约 22–26 秒",
-            "六轨 · 加吉他/钢琴": "约 16–20 秒",
+            "人声 / 伴奏 · 高质量": "约 15–20 秒",
+            "四轨 · 人声/鼓/贝斯/其他": "约 15–20 秒",
+            "六轨 · 加吉他/钢琴": "约 15–20 秒",
         }[profile_name]
         if input_source == "airplay":
             return (
@@ -246,11 +312,21 @@ def start_live_capture(
             )
         return f"🟡 **正在启动 {profile_name}** · 首个 AI 结果{latency}"
     except Exception as exc:
+        if created_reservation:
+            with _RESERVATION_LOCK:
+                if _LIVE_RESERVATION is not None:
+                    _LIVE_RESERVATION.release()
+                    _LIVE_RESERVATION = None
         return f"🔴 **启动失败** · {exc}"
 
 
 def stop_live_capture() -> str:
+    global _LIVE_RESERVATION
     write_command(LIVE_DIR, "stop")
+    with _RESERVATION_LOCK:
+        if _LIVE_RESERVATION is not None:
+            _LIVE_RESERVATION.release()
+            _LIVE_RESERVATION = None
     return "⚪ **已发送停止命令**"
 
 
@@ -263,9 +339,17 @@ def open_audio_settings() -> str:
 
 
 def build_app() -> gr.Blocks:
+    config = _hardware_config()
+    allowed_live_profiles = {
+        name: profile
+        for name, profile in LIVE_PROFILES.items()
+        if len(profile.stems) <= max(2, config.max_live_tracks)
+    }
     initial_live = live_ui_defaults(LIVE_DIR)
     initial_source = initial_live["input_source"]
     initial_profile = initial_live["profile_name"]
+    if initial_profile not in allowed_live_profiles:
+        initial_profile = next(iter(allowed_live_profiles))
     initial_device_endpoint = initial_live["device_endpoint"]
     initial_gains = initial_live["gains"]
     with gr.Blocks(title="Stem Studio") as app:
@@ -278,7 +362,7 @@ def build_app() -> gr.Blocks:
             with gr.Tab("实时分离"):
                 gr.Markdown(
                     "可捕获所选 Windows 音乐软件，也可由内置 UxPlay 1.74 宿主接收手机 AirPlay，解码 PCM 后直接分离。"
-                    "支持二轨、四轨或六轨实时输出模式；采用 12 秒分析窗、6 秒步进和 100ms 同时间轴交叉拼接。"
+                    f"支持二轨、四轨或六轨实时输出模式；采用 12 秒分析窗、{config.live_hop_seconds} 秒步进和 100ms 同时间轴交叉拼接。"
                 )
                 input_source = gr.Radio(
                     choices=[
@@ -298,7 +382,7 @@ def build_app() -> gr.Blocks:
                 live_profile = gr.Dropdown(
                     choices=[
                         (profile.display_name, profile_name)
-                        for profile_name, profile in LIVE_PROFILES.items()
+                        for profile_name, profile in allowed_live_profiles.items()
                     ],
                     value=initial_profile,
                     label="实时分离模式",
@@ -423,26 +507,40 @@ def build_app() -> gr.Blocks:
                         outputs = gr.File(label="分离结果", file_count="multiple")
         gr.Markdown(
             "首次使用某个模式会下载模型，之后会从本地缓存直接加载。"
-            "8GB 显存一次只运行一个任务，避免并发导致显存不足。"
+            f"当前硬件自动允许 {config.gpu_concurrency} 个文件任务并发；"
+            "实时捕获期间会独占 GPU，避免文件任务争抢显存和截止时间。"
         )
         run_button.click(
             fn=run_separation,
             inputs=[source, profile, output_format],
             outputs=[status, outputs],
-            concurrency_limit=1,
+            concurrency_limit=config.gpu_concurrency,
         )
     return app
 
 
 def main() -> None:
+    global _HARDWARE_CONFIG, _GPU_COORDINATOR
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     LYRICS_DIR.mkdir(parents=True, exist_ok=True)
+    _HARDWARE_CONFIG = detect_hardware_config()
+    apply_hardware_config(_HARDWARE_CONFIG)
+    write_hardware_profile(DATA_ROOT, _HARDWARE_CONFIG)
+    _GPU_COORDINATOR = GpuWorkCoordinator(_HARDWARE_CONFIG.gpu_concurrency)
     start_acceptance_service(DATA_ROOT / "live")
-    start_live_worker(DATA_ROOT / "live")
+    start_live_worker(
+        DATA_ROOT / "live",
+        inference_timeout_seconds=_HARDWARE_CONFIG.inference_timeout_seconds,
+        live_hop_seconds=_HARDWARE_CONFIG.live_hop_seconds,
+        demucs_shifts=_HARDWARE_CONFIG.demucs_shifts,
+        shifts_benchmark_limit_seconds=(
+            _HARDWARE_CONFIG.shifts_benchmark_limit_seconds
+        ),
+    )
     start_lyrics_service(LIVE_DIR, LYRICS_DIR)
     app = build_app()
-    app.queue(default_concurrency_limit=1).launch(
+    app.queue(default_concurrency_limit=_HARDWARE_CONFIG.gpu_concurrency).launch(
         server_name="0.0.0.0",
         server_port=7860,
         share=False,

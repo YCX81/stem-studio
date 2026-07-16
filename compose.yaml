@@ -16,7 +16,10 @@ services:
       - ./data/live:/data/live
     environment:
       TMPDIR: /data/temp
-      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_VISIBLE_DEVICES: ${STEM_STUDIO_GPU_DEVICE:-all}
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      STEM_STUDIO_GPU_INDEX: ${STEM_STUDIO_GPU_INDEX:-0}
+      STEM_STUDIO_GPU_CONCURRENCY: ${STEM_STUDIO_GPU_CONCURRENCY:-auto}
+      STEM_STUDIO_INFERENCE_TIMEOUT_SECONDS: ${STEM_STUDIO_INFERENCE_TIMEOUT_SECONDS:-auto}
     restart: unless-stopped
     init: true

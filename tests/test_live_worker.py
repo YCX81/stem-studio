@@ -9,7 +9,12 @@ from stemstudio.core import LIVE_PROFILES
 from stemstudio.inference_process import InferenceDeadlineExceeded, InferenceWarmingUp
 from stemstudio.live import LiveConfig
 from stemstudio.live_control import write_command
-from stemstudio.live_worker import LiveWorker, last_published_sequence, prune_live_artifacts
+from stemstudio.live_worker import (
+    LiveWorker,
+    last_published_sequence,
+    prune_live_artifacts,
+    start_live_worker,
+)
 from stemstudio.song_cache import SongCache, SongCacheProfile, SongTrackMetadata
 
 
@@ -50,6 +55,48 @@ def test_live_worker_does_not_load_gpu_model_until_a_chunk_is_ready(tmp_path: Pa
     assert calls == []
 
 
+def test_start_live_worker_forwards_dynamic_inference_timeout(
+    tmp_path: Path, monkeypatch
+) -> None:
+    created: list[tuple[float, int, int, float]] = []
+
+    class FakeWorker:
+        def __init__(
+            self,
+            _root,
+            *,
+            inference_timeout_seconds: float,
+            live_hop_seconds: int,
+            demucs_shifts: int,
+            shifts_benchmark_limit_seconds: float,
+        ) -> None:
+            created.append(
+                (
+                    inference_timeout_seconds,
+                    live_hop_seconds,
+                    demucs_shifts,
+                    shifts_benchmark_limit_seconds,
+                )
+            )
+
+        def run(self, stop_event: threading.Event) -> None:
+            stop_event.set()
+
+    monkeypatch.setattr("stemstudio.live_worker.LiveWorker", FakeWorker)
+
+    thread, stop_event = start_live_worker(
+        tmp_path,
+        inference_timeout_seconds=2.7,
+        live_hop_seconds=3,
+        demucs_shifts=2,
+        shifts_benchmark_limit_seconds=2.4,
+    )
+    thread.join(timeout=1.0)
+
+    assert stop_event.is_set()
+    assert created == [(2.7, 3, 2, 2.4)]
+
+
 def test_live_worker_status_is_atomically_parseable(tmp_path: Path) -> None:
     worker = LiveWorker(tmp_path, separator_factory=lambda _profile: None)
     worker._write_status({"state": "waiting", "last_sequence": 3})
@@ -57,7 +104,7 @@ def test_live_worker_status_is_atomically_parseable(tmp_path: Path) -> None:
     assert payload["state"] == "waiting"
     assert payload["last_sequence"] == 3
     assert payload["model_state"] == "stopped"
-    assert payload["inference_timeout_seconds"] == 5.5
+    assert payload["inference_timeout_seconds"] == 2.8
     assert not (tmp_path / "gpu-status.json.part").exists()
 
 
@@ -500,6 +547,7 @@ def test_live_worker_uses_original_mix_to_drain_realtime_backlog_before_gpu(
     worker = LiveWorker(
         tmp_path,
         separator_factory=lambda _profile: model_loads.append("loaded"),
+        inference_timeout_seconds=5.5,
     )
     worker.config = LiveConfig(
         sample_rate=10,
@@ -541,6 +589,7 @@ def test_live_worker_uses_original_mix_before_gpu_when_buffer_is_below_deadline_
     worker = LiveWorker(
         tmp_path,
         separator_factory=lambda _profile: model_loads.append("loaded"),
+        inference_timeout_seconds=5.5,
     )
     worker.config = LiveConfig(
         sample_rate=10,

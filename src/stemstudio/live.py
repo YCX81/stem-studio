@@ -155,9 +155,12 @@ class PersistentSeparator:
         model_dir: str | Path,
         work_dir: str | Path,
         model_filename: str,
+        demucs_shifts: int = 1,
         separator_factory: Callable[..., Any] | None = None,
         resident_demucs_factory: Callable[[Any], Any] | None = None,
     ) -> None:
+        if demucs_shifts not in {1, 2}:
+            raise ValueError("实时 Demucs shifts 仅支持 1 或 2。")
         self.model_dir = Path(model_dir).resolve()
         self.work_dir = Path(work_dir).resolve()
         self.model_filename = model_filename
@@ -181,7 +184,7 @@ class PersistentSeparator:
             },
             demucs_params={
                 "segment_size": "Default",
-                "shifts": 1,
+                "shifts": demucs_shifts,
                 "overlap": 0.25,
                 "segments_enabled": True,
             },

@@ -129,7 +129,10 @@ class LiveWorker:
         data_root: str | Path,
         separator_factory: Callable[[LiveProfile], PersistentSeparator] | None = None,
         cache_quota_bytes: int = _default_cache_quota_bytes,
-        inference_timeout_seconds: float = 5.5,
+        inference_timeout_seconds: float = 2.8,
+        live_hop_seconds: int = 3,
+        demucs_shifts: int = 1,
+        shifts_benchmark_limit_seconds: float = 2.4,
     ) -> None:
         if cache_quota_bytes < 0:
             raise ValueError("缓存容量上限不得为负数。")
@@ -142,7 +145,7 @@ class LiveWorker:
         self.failed = self.root / "failed"
         for directory in (self.inbox, self.outbox, self.work, self.failed):
             directory.mkdir(parents=True, exist_ok=True)
-        self.config = LiveConfig()
+        self.config = LiveConfig(hop_seconds=live_hop_seconds)
         self._separator_factory = separator_factory or self._default_separator
         self._processor: LiveChunkProcessor | None = None
         self._last_sequence = last_published_sequence(self.outbox)
@@ -157,6 +160,8 @@ class LiveWorker:
         )
         self._cache_quota_bytes = cache_quota_bytes
         self._inference_timeout_seconds = float(inference_timeout_seconds)
+        self._demucs_shifts = demucs_shifts
+        self._shifts_benchmark_limit_seconds = shifts_benchmark_limit_seconds
         self._last_cache_error: str | None = None
         self._processor_start_error: str | None = None
         self._cache_hits = 0
@@ -197,6 +202,9 @@ class LiveWorker:
             work_dir=self.work,
             model_filename=profile.model_filename,
             inference_timeout_seconds=self._inference_timeout_seconds,
+            demucs_shifts=self._demucs_shifts,
+            shifts_benchmark_limit_seconds=self._shifts_benchmark_limit_seconds,
+            window_seconds=self.config.window_seconds,
         )
 
     def _create_processor(self, separator=None) -> LiveChunkProcessor:
@@ -265,6 +273,12 @@ class LiveWorker:
         profile_name = str(payload.get("profile_name", "人声 / 伴奏 · 高质量"))
         if profile_name not in LIVE_PROFILES:
             raise ValueError("实时控制命令包含未知分离模式。")
+        requested_hop = int(payload.get("hop_seconds", self.config.hop_seconds))
+        if requested_hop != self.config.hop_seconds:
+            raise ValueError(
+                f"音频宿主步进 {requested_hop} 秒与 GPU worker 步进 "
+                f"{self.config.hop_seconds} 秒不一致。"
+            )
         requested = LIVE_PROFILES[profile_name]
         if requested != self._active_profile:
             self._reset_song_assembly()
@@ -1350,8 +1364,21 @@ class LiveWorker:
         self._last_written_status = complete_payload
 
 
-def start_live_worker(data_root: str | Path) -> tuple[threading.Thread, threading.Event]:
-    worker = LiveWorker(data_root)
+def start_live_worker(
+    data_root: str | Path,
+    *,
+    inference_timeout_seconds: float = 2.8,
+    live_hop_seconds: int = 3,
+    demucs_shifts: int = 1,
+    shifts_benchmark_limit_seconds: float = 2.4,
+) -> tuple[threading.Thread, threading.Event]:
+    worker = LiveWorker(
+        data_root,
+        inference_timeout_seconds=inference_timeout_seconds,
+        live_hop_seconds=live_hop_seconds,
+        demucs_shifts=demucs_shifts,
+        shifts_benchmark_limit_seconds=shifts_benchmark_limit_seconds,
+    )
     stop_event = threading.Event()
     thread = threading.Thread(target=worker.run, args=(stop_event,), name="live-gpu-worker", daemon=True)
     thread.start()

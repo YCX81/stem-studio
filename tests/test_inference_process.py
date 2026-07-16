@@ -10,8 +10,52 @@ from stemstudio.inference_process import (
     InferenceProcessError,
     InferenceWarmingUp,
     IsolatedPersistentSeparator,
+    _prepare_persistent_separator,
     _warm_up_separator,
 )
+
+
+@pytest.mark.parametrize(
+    ("timings", "expected_shifts", "fallback"),
+    [([4.0, 2.1], 2, False), ([4.0, 2.55, 1.7], 1, True)],
+)
+def test_autotunes_two_shift_model_against_hot_inference_budget(
+    tmp_path: Path,
+    timings: list[float],
+    expected_shifts: int,
+    fallback: bool,
+) -> None:
+    created = []
+
+    class FakeSeparator:
+        def __init__(self, **kwargs):
+            self.shifts = kwargs["demucs_shifts"]
+            self.closed = False
+            created.append(self)
+
+        def close(self) -> None:
+            self.closed = True
+
+    observed_timings = iter(timings)
+    separator, telemetry = _prepare_persistent_separator(
+        {
+            "model_dir": tmp_path / "models",
+            "work_dir": tmp_path / "work",
+            "model_filename": "htdemucs_6s.yaml",
+            "demucs_shifts": 2,
+            "shifts_benchmark_limit_seconds": 2.4,
+        },
+        separator_factory=FakeSeparator,
+        warm_up=lambda *_args, **_kwargs: next(observed_timings),
+    )
+
+    assert separator.shifts == expected_shifts
+    assert telemetry["effective_demucs_shifts"] == expected_shifts
+    assert telemetry["shifts_benchmark_seconds"] == timings[1]
+    assert telemetry["shifts_fallback"] is fallback
+    if fallback:
+        assert [item.shifts for item in created] == [2, 1]
+        assert created[0].closed is True
 
 
 def _fake_inference_worker(connection: Connection, config: dict) -> None:

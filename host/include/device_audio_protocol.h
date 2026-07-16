@@ -15,6 +15,7 @@ inline constexpr std::size_t device_max_datagram_bytes = 1'400;
 inline constexpr std::size_t device_audio_header_bytes = 40;
 inline constexpr std::size_t device_control_packet_bytes = 48;
 inline constexpr std::uint16_t device_unity_gain_q15 = 32'768;
+inline constexpr std::uint16_t device_audio_flag_silence = 0x0001;
 
 enum class DevicePacketError : std::uint8_t {
     none,
@@ -41,6 +42,7 @@ struct DeviceAudioPacketHeader final {
     std::uint64_t presentation_frame{0};
     std::uint32_t sample_rate{44'100};
     std::uint8_t channels{2};
+    std::uint16_t flags{0};
 };
 
 struct ParsedDeviceAudioPacket final {

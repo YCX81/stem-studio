@@ -1,5 +1,7 @@
 #include "audio_window_buffer.h"
 #include "atomic_file.h"
+#include "device_audio_queue.h"
+#include "device_udp_sender.h"
 #include "live_paths.h"
 #include "mixer_control.h"
 #include "process_loopback_capture.h"
@@ -21,6 +23,7 @@
 #include <fstream>
 #include <iostream>
 #include <mutex>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -121,6 +124,8 @@ void write_playback_status(
     const std::uint64_t control_sequence,
     const stemstudio::MixerControlMetricsSnapshot control_metrics,
     const std::size_t gain_smoothing_frames,
+    const stemstudio::DeviceAudioPacketQueue* const device_queue,
+    const stemstudio::DeviceUdpSender* const device_sender,
     const std::string_view fatal_error,
     const std::string_view control_error) {
     const auto buffer_stats = buffer.stats();
@@ -185,6 +190,22 @@ void write_playback_status(
            << std::format(
                   "{:.3f}",
                   static_cast<double>(gain_smoothing_frames) * 1'000.0 / sample_rate);
+    if (device_queue != nullptr && device_sender != nullptr) {
+        const auto queue_stats = device_queue->stats();
+        const auto sender_stats = device_sender->stats();
+        output << ",\"device_network_enabled\":true"
+               << ",\"device_queue_packets\":" << queue_stats.depth_packets
+               << ",\"device_queue_capacity_packets\":" << queue_stats.capacity_packets
+               << ",\"device_enqueued_packets\":" << queue_stats.enqueued_packets
+               << ",\"device_dropped_packets\":" << queue_stats.dropped_packets
+               << ",\"device_dropped_frames\":" << queue_stats.dropped_frames
+               << ",\"device_sent_packets\":" << sender_stats.sent_packets
+               << ",\"device_sent_bytes\":" << sender_stats.sent_bytes
+               << ",\"device_send_errors\":" << sender_stats.send_errors
+               << ",\"device_last_socket_error\":" << sender_stats.last_socket_error;
+    } else {
+        output << ",\"device_network_enabled\":false";
+    }
     if (renderer_stats.last_device_hresult != 0) {
         output << ",\"last_device_hresult\":\""
                << std::format(
@@ -226,9 +247,9 @@ void write_playback_status(
 }  // namespace
 
 int wmain(const int argc, wchar_t* argv[]) {
-    if (argc < 3 || argc > 4) {
+    if (argc < 3 || argc > 5) {
         std::wcerr << L"Usage: stem-studio-audio-host <process-id|--playback-only> "
-                      L"<live-data-directory> [2|4|6]\n";
+                      L"<live-data-directory> [2|4|6] [device-ipv4:udp-port]\n";
         return 2;
     }
 
@@ -244,7 +265,7 @@ int wmain(const int argc, wchar_t* argv[]) {
     }
 
     try {
-        const auto track_count = parse_track_count(argc == 4 ? std::wstring_view{argv[3]} : L"2");
+        const auto track_count = parse_track_count(argc >= 4 ? std::wstring_view{argv[3]} : L"2");
         const auto active_stems = stemstudio::stems_for_profile(track_count);
         const auto live_root = std::filesystem::absolute(argv[2]);
         const auto inbox = live_root / L"inbox";
@@ -268,11 +289,31 @@ int wmain(const int argc, wchar_t* argv[]) {
             hop_frames * stemstudio::default_live_buffer_capacity_hops,
             hop_frames * stemstudio::default_live_prebuffer_hops,
         };
+        std::unique_ptr<stemstudio::DeviceAudioPacketQueue> device_queue;
+        std::unique_ptr<stemstudio::DeviceUdpSender> device_sender;
+        if (argc == 5) {
+            const auto endpoint = stemstudio::parse_device_udp_endpoint(argv[4]);
+            const auto session_id = static_cast<std::uint32_t>(
+                current_system_time_nanoseconds() ^ static_cast<std::uint64_t>(GetCurrentProcessId()));
+            constexpr std::size_t device_queue_capacity_packets = 128;
+            const auto frames_per_packet = static_cast<std::size_t>(geometry.sample_rate) / 200;
+            device_queue = std::make_unique<stemstudio::DeviceAudioPacketQueue>(
+                session_id,
+                geometry.sample_rate,
+                geometry.channels,
+                device_queue_capacity_packets,
+                frames_per_packet);
+            device_sender = std::make_unique<stemstudio::DeviceUdpSender>(
+                endpoint.ipv4_address,
+                endpoint.port,
+                *device_queue);
+        }
         stemstudio::WasapiStemRenderer renderer{
             geometry.sample_rate,
             geometry.channels,
             stream_buffer,
             gain_smoothing_frames,
+            device_queue.get(),
         };
         stemstudio::StemSequenceStitcher sequence_stitcher{
             geometry.channels,
@@ -361,6 +402,10 @@ int wmain(const int argc, wchar_t* argv[]) {
                 record_error(error.what());
             }
         });
+        std::optional<std::jthread> device_sender_thread;
+        if (device_sender != nullptr) {
+            device_sender_thread.emplace([&] { device_sender->run(stop_requested); });
+        }
 
         std::atomic<std::uint64_t> applied_control_sequence{0};
         stemstudio::MixerControlMetrics control_metrics{current_system_time_nanoseconds()};
@@ -409,6 +454,8 @@ int wmain(const int argc, wchar_t* argv[]) {
                         applied_control_sequence.load(std::memory_order_acquire),
                         control_metrics.snapshot(),
                         gain_smoothing_frames,
+                        device_queue.get(),
+                        device_sender.get(),
                         read_error(),
                         read_control_error());
                     std::this_thread::sleep_for(std::chrono::milliseconds(250));
@@ -428,6 +475,8 @@ int wmain(const int argc, wchar_t* argv[]) {
                     applied_control_sequence.load(std::memory_order_acquire),
                     control_metrics.snapshot(),
                     gain_smoothing_frames,
+                    device_queue.get(),
+                    device_sender.get(),
                     read_error(),
                     read_control_error());
             } catch (const std::exception& error) {
@@ -465,6 +514,9 @@ int wmain(const int argc, wchar_t* argv[]) {
         stop_requested.store(true, std::memory_order_release);
         loader_thread.join();
         renderer_thread.join();
+        if (device_sender_thread.has_value()) {
+            device_sender_thread->join();
+        }
         control_thread.join();
         status_thread.join();
         const auto error = read_error();

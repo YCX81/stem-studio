@@ -16,6 +16,7 @@ constexpr std::size_t audio_checksum_offset = 36;
 constexpr std::size_t control_checksum_offset = 44;
 constexpr std::size_t checksum_bytes = 4;
 constexpr std::size_t bytes_per_pcm16_sample = 2;
+constexpr std::uint16_t known_audio_flags = device_audio_flag_silence;
 
 [[nodiscard]] bool supported_sample_rate(const std::uint32_t sample_rate) noexcept {
     return sample_rate == 44'100U || sample_rate == 48'000U;
@@ -137,6 +138,9 @@ DeviceEncodeResult encode_device_audio_packet(
         interleaved_pcm.empty() || interleaved_pcm.size() % header.channels != 0) {
         return {.error = DevicePacketError::invalid_geometry};
     }
+    if ((header.flags & static_cast<std::uint16_t>(~known_audio_flags)) != 0) {
+        return {.error = DevicePacketError::invalid_header};
+    }
 
     const std::size_t frame_count = interleaved_pcm.size() / header.channels;
     const std::size_t payload_bytes = interleaved_pcm.size() * bytes_per_pcm16_sample;
@@ -161,6 +165,7 @@ DeviceEncodeResult encode_device_audio_packet(
     packet[30] = static_cast<std::byte>(header.channels);
     packet[31] = static_cast<std::byte>(pcm_s16_le_format);
     write_u16(packet, 32, static_cast<std::uint16_t>(payload_bytes));
+    write_u16(packet, 34, header.flags);
 
     for (std::size_t index = 0; index < interleaved_pcm.size(); ++index) {
         write_u16(
@@ -191,14 +196,17 @@ DeviceAudioParseResult parse_device_audio_packet(
     const auto channels = std::to_integer<std::uint8_t>(packet[30]);
     const auto sample_format = std::to_integer<std::uint8_t>(packet[31]);
     const auto payload_bytes = read_u16(packet, 32);
-    const auto reserved = read_u16(packet, 34);
+    const auto flags = read_u16(packet, 34);
     if (channels != 2 || !supported_sample_rate(sample_rate) ||
         sample_format != pcm_s16_le_format || frame_count == 0) {
         return {.error = DevicePacketError::invalid_geometry};
     }
     const std::size_t expected_payload_bytes =
         static_cast<std::size_t>(frame_count) * channels * bytes_per_pcm16_sample;
-    if (reserved != 0 || payload_bytes != expected_payload_bytes ||
+    if ((flags & static_cast<std::uint16_t>(~known_audio_flags)) != 0) {
+        return {.error = DevicePacketError::invalid_header};
+    }
+    if (payload_bytes != expected_payload_bytes ||
         packet.size() != device_audio_header_bytes + expected_payload_bytes) {
         return {.error = DevicePacketError::invalid_length};
     }
@@ -215,6 +223,7 @@ DeviceAudioParseResult parse_device_audio_packet(
                 .presentation_frame = read_u64(packet, 16),
                 .sample_rate = sample_rate,
                 .channels = channels,
+                .flags = flags,
             },
             .frame_count = frame_count,
             .payload = packet.subspan(device_audio_header_bytes, payload_bytes),

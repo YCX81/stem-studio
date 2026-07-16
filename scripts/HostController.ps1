@@ -20,6 +20,7 @@ $airplayProcess = $null
 $playbackPriority = $null
 $airplayPriority = $null
 $activeProfileName = ''
+$activeDeviceEndpoint = ''
 $activeLanInterface = $null
 $audioScanCountdown = 0
 $controllerHeartbeat = Join-Path $live 'controller-heartbeat.json'
@@ -38,6 +39,7 @@ function Stop-Playback {
     $script:captureProcess = $null
     $script:playbackPriority = $null
     $script:activeProfileName = ''
+    $script:activeDeviceEndpoint = ''
 }
 
 function Stop-AirPlayReceiver {
@@ -158,9 +160,13 @@ try {
                         if (-not (Test-Path -LiteralPath $airplayExe)) { throw "缺少内置 AirPlay 宿主：$airplayExe" }
                         $profileName = [string]$command.profile_name
                         $trackCount = Assert-LiveTrackCount ([int]$command.track_count)
+                        $deviceEndpoint = ''
+                        if ($null -ne $command.PSObject.Properties['device_endpoint']) {
+                            $deviceEndpoint = Assert-DeviceAudioEndpoint ([string]$command.device_endpoint)
+                        }
                         $airplayRunning = $null -ne $airplayProcess -and -not $airplayProcess.HasExited
                         $playbackRunning = $null -ne $captureProcess -and -not $captureProcess.HasExited
-                        $startPlan = Get-AirPlayStartPlan -AirPlayRunning $airplayRunning -PlaybackRunning $playbackRunning -CurrentProfile $activeProfileName -RequestedProfile $profileName
+                        $startPlan = Get-AirPlayStartPlan -AirPlayRunning $airplayRunning -PlaybackRunning $playbackRunning -CurrentProfile $activeProfileName -RequestedProfile $profileName -CurrentDeviceEndpoint $activeDeviceEndpoint -RequestedDeviceEndpoint $deviceEndpoint
                         if ($startPlan.RestartAirPlay) {
                             Stop-Capture
                         } elseif ($startPlan.RestartPlayback) {
@@ -169,9 +175,11 @@ try {
                         $stdout = Join-Path $live 'playback-stdout.log'
                         $stderr = Join-Path $live 'playback-stderr.log'
                         if ($startPlan.RestartPlayback) {
-                            $captureProcess = Start-Process -FilePath $hostExe -ArgumentList @('--playback-only', 'data\live', $trackCount) -WorkingDirectory $rootPath -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+                            $playbackArgs = @(New-AudioHostArgumentList -Source '--playback-only' -LiveDirectory 'data\live' -TrackCount $trackCount -DeviceEndpoint $deviceEndpoint)
+                            $captureProcess = Start-Process -FilePath $hostExe -ArgumentList $playbackArgs -WorkingDirectory $rootPath -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
                             $playbackPriority = Set-StreamingProcessPriority $captureProcess
                             $activeProfileName = $profileName
+                            $activeDeviceEndpoint = $deviceEndpoint
                         }
                         $airplayStdout = Join-Path $live 'airplay-stdout.log'
                         $airplayStderr = Join-Path $live 'airplay-stderr.log'
@@ -192,7 +200,7 @@ try {
                                 throw
                             }
                         }
-                        Write-AtomicJson (Join-Path $live 'controller-status.json') ([ordered]@{ state='airplay_waiting'; input_source='airplay'; monitor_stem='mix'; profile_name=$profileName; track_count=$trackCount; host_pid=$captureProcess.Id; airplay_pid=$airplayProcess.Id; playback_priority=$playbackPriority; airplay_priority=$airplayPriority; lan_interface=$(if ($null -ne $activeLanInterface) { $activeLanInterface.Name } else { $null }); lan_ipv4=$(if ($null -ne $activeLanInterface) { $activeLanInterface.IPv4 } else { $null }); connection_reused=(-not $startPlan.RestartAirPlay) })
+                        Write-AtomicJson (Join-Path $live 'controller-status.json') ([ordered]@{ state='airplay_waiting'; input_source='airplay'; monitor_stem='mix'; profile_name=$profileName; track_count=$trackCount; device_endpoint=$(if ($deviceEndpoint) { $deviceEndpoint } else { $null }); host_pid=$captureProcess.Id; airplay_pid=$airplayProcess.Id; playback_priority=$playbackPriority; airplay_priority=$airplayPriority; lan_interface=$(if ($null -ne $activeLanInterface) { $activeLanInterface.Name } else { $null }); lan_ipv4=$(if ($null -ne $activeLanInterface) { $activeLanInterface.IPv4 } else { $null }); connection_reused=(-not $startPlan.RestartAirPlay) })
                     } elseif ($command.action -eq 'start') {
                         Stop-Capture
                         $target = Get-Process -Id ([int]$command.process_id) -ErrorAction Stop
@@ -200,10 +208,16 @@ try {
                         $stderr = Join-Path $live 'capture-stderr.log'
                         $profileName = [string]$command.profile_name
                         $trackCount = Assert-LiveTrackCount ([int]$command.track_count)
-                        $captureProcess = Start-Process -FilePath $hostExe -ArgumentList @($target.Id, 'data\live', $trackCount) -WorkingDirectory $rootPath -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+                        $deviceEndpoint = ''
+                        if ($null -ne $command.PSObject.Properties['device_endpoint']) {
+                            $deviceEndpoint = Assert-DeviceAudioEndpoint ([string]$command.device_endpoint)
+                        }
+                        $captureArgs = @(New-AudioHostArgumentList -Source ([string]$target.Id) -LiveDirectory 'data\live' -TrackCount $trackCount -DeviceEndpoint $deviceEndpoint)
+                        $captureProcess = Start-Process -FilePath $hostExe -ArgumentList $captureArgs -WorkingDirectory $rootPath -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
                         $playbackPriority = Set-StreamingProcessPriority $captureProcess
                         $activeProfileName = $profileName
-                        Write-AtomicJson (Join-Path $live 'controller-status.json') ([ordered]@{ state='capturing'; process_id=$target.Id; process_name=$target.ProcessName; monitor_stem='mix'; profile_name=$profileName; track_count=$trackCount; host_pid=$captureProcess.Id; playback_priority=$playbackPriority })
+                        $activeDeviceEndpoint = $deviceEndpoint
+                        Write-AtomicJson (Join-Path $live 'controller-status.json') ([ordered]@{ state='capturing'; process_id=$target.Id; process_name=$target.ProcessName; monitor_stem='mix'; profile_name=$profileName; track_count=$trackCount; device_endpoint=$(if ($deviceEndpoint) { $deviceEndpoint } else { $null }); host_pid=$captureProcess.Id; playback_priority=$playbackPriority })
                     } elseif ($command.action -eq 'stop') {
                         Stop-Capture
                         Write-AtomicJson (Join-Path $live 'controller-status.json') ([ordered]@{ state='stopped' })

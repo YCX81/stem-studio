@@ -91,7 +91,15 @@ docker compose logs -f app
 - 内置宿主将解码 PCM 与原子时间轴侧车写入 `data/live/inbox`，Docker GPU worker 只读取完整窗口；手机不连接 Docker，也不使用额外 UDP 端口。
 - AirPlay 会话的接入、PCM、flush、网络重置和关闭事件会分别发布 `connected`、`streaming`、`paused`、`recovering` 和 `waiting`，避免会话断开后继续显示过期的 `streaming`。
 
-黄山派网络播放器采用“桌面混合、设备控制与立体声播放”的 v1 架构。仓库已提供无动态分配的 PCM/控制包编解码核心；完整线格式、带宽、轨位掩码、抖动缓冲和扩展板职责见 [设备音频协议 v1](docs/device-audio-protocol-v1.md)。Windows 异步发送器与目标板固件尚未接入，因此当前不能把协议测试等同于真机无卡顿验收。
+黄山派网络播放器采用“桌面混合、设备控制与立体声播放”的 v1 架构。仓库已提供 PCM/控制包编解码、预分配有界队列和 Windows 异步 UDP 发送器；完整线格式、带宽、轨位掩码、抖动缓冲和扩展板职责见 [设备音频协议 v1](docs/device-audio-protocol-v1.md)。启动命令中的可选 `device_endpoint` 使用 `IPv4:UDP端口`，改变它只重启 WASAPI/网络播放宿主，不中断手机 AirPlay 接收器。目标板接收固件尚未实现，因此桌面 UDP 回环测试仍不能等同于真机无卡顿验收。
+
+控制器命令示例（不填写 `device_endpoint` 时保持仅本机播放）：
+
+```json
+{"sequence": 1, "action": "start_airplay", "profile_name": "六轨 · 加吉他/钢琴", "track_count": 6, "device_endpoint": "192.168.31.88:4010"}
+```
+
+启用后，`data/live/playback-status.json` 会持续报告网络队列深度、丢弃帧数、发送包数、发送字节、发送错误和最后一个 Winsock 错误。队列满时实时渲染线程不会等待；对应序号和播放帧保持前进，让黄山派明确检测缺口，而不是悄悄改变时间轴。
 
 真机产品验收可运行 `python tools/monitor_live_acceptance.py --timeout-seconds 1800`。监视器要求手机完整首播产生 GPU 窗口和整曲缓存、同曲重播命中歌曲缓存、播放期间欠载/声卡重连/分轨跳窗全部保持为零，并在真实音频播放时至少收到一次不高于 50 ms 的滑杆更新；外部监视结果会持续原子写入 `data/live/acceptance-monitor-report.json`，不会再与桌面端内置的 `data/live/acceptance-report.json` 争用临时文件或相互覆盖。同一项目只能有一份外部监视器持有 OS 独占锁，重复启动会返回 `already_running` 和现有 PID，异常退出后锁会由操作系统自动释放。暂停或断流阶段的队列自然排空、端点变化和历史跳窗不会污染下一次活跃播放段的验收基线。
 

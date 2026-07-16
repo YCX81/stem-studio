@@ -21,6 +21,7 @@ void test_audio_packet_round_trip_has_explicit_wire_layout() {
         .presentation_frame = 0x0102030405060708ULL,
         .sample_rate = 44'100U,
         .channels = 2,
+        .flags = stemstudio::device_audio_flag_silence,
     };
     constexpr std::array<std::int16_t, 4> pcm{0x1234, -2, 32'767, -32'768};
     std::array<std::byte, stemstudio::device_max_datagram_bytes> wire{};
@@ -42,6 +43,8 @@ void test_audio_packet_round_trip_has_explicit_wire_layout() {
     require(wire[40] == std::byte{0x34} && wire[41] == std::byte{0x12} &&
                 wire[42] == std::byte{0xfe} && wire[43] == std::byte{0xff},
             "PCM16 payload must use little-endian wire order");
+    require(wire[34] == std::byte{1} && wire[35] == std::byte{0},
+            "silence flag must use the audio flags field");
 
     const auto decoded = stemstudio::parse_device_audio_packet(
         std::span<const std::byte>{wire}.first(encoded.bytes_written));
@@ -52,6 +55,8 @@ void test_audio_packet_round_trip_has_explicit_wire_layout() {
     require(decoded.packet->header.presentation_frame == header.presentation_frame,
             "presentation frame changed");
     require(decoded.packet->frame_count == 2, "audio frame count mismatch");
+    require(decoded.packet->header.flags == stemstudio::device_audio_flag_silence,
+            "audio flags changed");
 
     std::array<std::int16_t, pcm.size()> restored{};
     const auto pcm_error = stemstudio::decode_device_pcm16(decoded.packet->payload, restored);
@@ -91,6 +96,13 @@ void test_audio_packet_rejects_corruption_and_unsafe_geometry() {
         stemstudio::encode_device_audio_packet(invalid_header, pcm, wire).error ==
             stemstudio::DevicePacketError::invalid_geometry,
         "v1 device audio must reject unsupported sample rates");
+
+    invalid_header = header;
+    invalid_header.flags = 0x8000;
+    require(
+        stemstudio::encode_device_audio_packet(invalid_header, pcm, wire).error ==
+            stemstudio::DevicePacketError::invalid_header,
+        "unknown audio flags must be rejected");
 
     std::array<std::byte, 20> short_output{};
     require(

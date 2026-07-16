@@ -516,6 +516,7 @@ def test_live_ui_defaults_follow_active_airplay_profile_and_mixer(tmp_path: Path
                 "input_source": "airplay",
                 "profile_name": "六轨 · 加吉他/钢琴",
                 "track_count": 6,
+                "device_endpoint": "192.168.31.88:4010",
             }
         ),
         encoding="utf-8",
@@ -541,6 +542,7 @@ def test_live_ui_defaults_follow_active_airplay_profile_and_mixer(tmp_path: Path
 
     assert defaults["input_source"] == "airplay"
     assert defaults["profile_name"] == "六轨 · 加吉他/钢琴"
+    assert defaults["device_endpoint"] == "192.168.31.88:4010"
     assert defaults["gains"]["vocals"] == 0.0
     assert defaults["gains"]["piano"] == 0.8
 
@@ -741,6 +743,58 @@ def test_write_command_starts_airplay_host_without_process_id(tmp_path: Path) ->
         "profile_name": "四轨 · 人声/鼓/贝斯/其他",
         "track_count": 4,
     }
+
+
+def test_write_command_validates_and_publishes_device_endpoint(tmp_path: Path) -> None:
+    sequence = write_command(
+        tmp_path,
+        "start_airplay",
+        monitor_stem="vocals",
+        profile_name="人声 / 伴奏 · 高质量",
+        device_endpoint=" 192.168.31.88:4010 ",
+    )
+    payload = json.loads((tmp_path / "command.json").read_text(encoding="utf-8"))
+    assert payload["sequence"] == sequence
+    assert payload["device_endpoint"] == "192.168.31.88:4010"
+
+    for invalid in (
+        "speaker.local:4010",
+        "192.168.031.88:4010",
+        "192.168.31.88:0",
+        "::1:4010",
+    ):
+        with pytest.raises(ValueError, match="设备地址"):
+            write_command(tmp_path, "start_airplay", device_endpoint=invalid)
+
+
+def test_live_dashboard_exposes_device_network_queue_and_errors(tmp_path: Path) -> None:
+    (tmp_path / "playback-status.json").write_text(
+        json.dumps(
+            {
+                "device_network_enabled": True,
+                "device_queue_packets": 7,
+                "device_queue_capacity_packets": 128,
+                "device_dropped_packets": 3,
+                "device_dropped_frames": 660,
+                "device_sent_packets": 900,
+                "device_sent_bytes": 123456,
+                "device_send_errors": 2,
+                "device_last_socket_error": 10051,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    snapshot = live_pipeline_snapshot(tmp_path)
+    assert snapshot["device_network_enabled"] is True
+    assert snapshot["device_queue_packets"] == 7
+    assert snapshot["device_dropped_frames"] == 660
+    assert snapshot["device_send_errors"] == 2
+    dashboard = live_dashboard_html(tmp_path)
+    assert "黄山派网络" in dashboard
+    assert "队列 7/128 包" in dashboard
+    assert "丢弃 660 帧" in dashboard
+    assert "Winsock 10051" in dashboard
 
 
 def test_active_stem_visibility_follows_selected_profile() -> None:

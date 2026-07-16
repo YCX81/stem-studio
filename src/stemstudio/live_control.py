@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import html
+import ipaddress
 import math
 import os
 import re
@@ -32,6 +33,21 @@ _ATOMIC_REPLACE_RETRY_SECONDS = 0.002
 _STATUS_READ_ATTEMPTS = 5
 _AIRPLAY_STREAM_STALE_SECONDS = 2.0
 _CONTROLLER_HEARTBEAT_STALE_SECONDS = 6.0
+
+
+def _normalize_device_endpoint(value: object) -> str:
+    candidate = str(value or "").strip()
+    if not candidate:
+        return ""
+    address_text, separator, port_text = candidate.rpartition(":")
+    try:
+        address = ipaddress.IPv4Address(address_text)
+        port = int(port_text)
+    except (ipaddress.AddressValueError, ValueError) as exc:
+        raise ValueError("黄山派设备地址必须使用 IPv4:UDP端口。") from exc
+    if not separator or not 1 <= port <= 65_535 or str(port) != port_text:
+        raise ValueError("黄山派设备地址必须使用 IPv4:UDP端口。")
+    return f"{address}:{port}"
 
 
 def _replace_with_sharing_retry(source: Path, destination: Path) -> None:
@@ -93,16 +109,29 @@ def live_ui_defaults(live_root: str | Path) -> dict:
     )
     input_source = "process"
     profile_name = "人声 / 伴奏 · 高质量"
+    device_endpoint = ""
 
     if state == "airplay_waiting" and controller_online:
         input_source = "airplay"
         candidate = controller.get("profile_name")
         if candidate in LIVE_PROFILES:
             profile_name = str(candidate)
+        try:
+            device_endpoint = _normalize_device_endpoint(
+                controller.get("device_endpoint", "")
+            )
+        except ValueError:
+            device_endpoint = ""
     elif state == "capturing" and controller_online:
         candidate = controller.get("profile_name")
         if candidate in LIVE_PROFILES:
             profile_name = str(candidate)
+        try:
+            device_endpoint = _normalize_device_endpoint(
+                controller.get("device_endpoint", "")
+            )
+        except ValueError:
+            device_endpoint = ""
     elif not state:
         command = _read_status(root / "command.json")
         if command.get("action") in {"start", "start_airplay"}:
@@ -112,6 +141,12 @@ def live_ui_defaults(live_root: str | Path) -> dict:
             candidate = command.get("profile_name")
             if candidate in LIVE_PROFILES:
                 profile_name = str(candidate)
+            try:
+                device_endpoint = _normalize_device_endpoint(
+                    command.get("device_endpoint", "")
+                )
+            except ValueError:
+                device_endpoint = ""
 
     gains = {stem: 1.0 for stem in STEM_LABELS}
     playback = _read_status(root / "playback-status.json")
@@ -129,6 +164,7 @@ def live_ui_defaults(live_root: str | Path) -> dict:
     return {
         "input_source": input_source,
         "profile_name": profile_name,
+        "device_endpoint": device_endpoint,
         "gains": gains,
     }
 
@@ -382,6 +418,20 @@ def live_pipeline_snapshot(live_root: str | Path) -> dict:
             nonnegative_number("device_buffer_frames") * 1_000.0 / 44_100.0,
             1,
         ),
+        "device_network_enabled": playback.get("device_network_enabled") is True,
+        "device_queue_packets": nonnegative_integer("device_queue_packets"),
+        "device_queue_capacity_packets": nonnegative_integer(
+            "device_queue_capacity_packets"
+        ),
+        "device_enqueued_packets": nonnegative_integer("device_enqueued_packets"),
+        "device_dropped_packets": nonnegative_integer("device_dropped_packets"),
+        "device_dropped_frames": nonnegative_integer("device_dropped_frames"),
+        "device_sent_packets": nonnegative_integer("device_sent_packets"),
+        "device_sent_bytes": nonnegative_integer("device_sent_bytes"),
+        "device_send_errors": nonnegative_integer("device_send_errors"),
+        "device_last_socket_error": nonnegative_integer(
+            "device_last_socket_error"
+        ),
         "control_sequence": max(0, int(nonnegative_number("control_sequence"))),
         "mixer_updates": max(0, int(nonnegative_number("mixer_updates"))),
         "last_mixer_control_latency_ms": round(
@@ -492,6 +542,16 @@ def live_dashboard_html(live_root: str | Path) -> str:
         continuity = (
             "Windows 输出设备正在自动重连；已分离的多轨缓冲仍然保留，"
             f"AirPlay 接收和 GPU 缓存不会重启。最近错误：{device_error}"
+        )
+    elif snapshot["device_network_enabled"] and (
+        snapshot["device_dropped_frames"] or snapshot["device_send_errors"]
+    ):
+        continuity_class = "bad"
+        continuity = (
+            "黄山派网络输出发生实时数据损失："
+            f"丢弃 {snapshot['device_dropped_frames']} 帧，"
+            f"发送错误 {snapshot['device_send_errors']} 次；"
+            "真机连续性验收不能通过。"
         )
     elif stream_stalled:
         continuity_class = "bad"
@@ -670,6 +730,18 @@ def live_dashboard_html(live_root: str | Path) -> str:
         f"{label} {'✓' if snapshot['acceptance_requirements'][name] else '○'}"
         for name, label in acceptance_check_labels
     )
+    if snapshot["device_network_enabled"]:
+        device_network_text = (
+            "黄山派网络 · "
+            f"队列 {snapshot['device_queue_packets']}/"
+            f"{snapshot['device_queue_capacity_packets']} 包 · "
+            f"已发送 {snapshot['device_sent_packets']} 包 · "
+            f"丢弃 {snapshot['device_dropped_frames']} 帧 · "
+            f"发送错误 {snapshot['device_send_errors']} 次 · "
+            f"Winsock {snapshot['device_last_socket_error']}"
+        )
+    else:
+        device_network_text = "黄山派网络未启用"
 
     return f"""
 <div class="stem-live">
@@ -711,6 +783,7 @@ def live_dashboard_html(live_root: str | Path) -> str:
       </div>
       <div class="stem-note">待处理 {snapshot['pending_windows']} 窗 · 可播放缓存 {snapshot['ready_buffer_seconds']:g} 秒 · 预缓冲 {snapshot['prebuffer_seconds']:g} 秒 · 单窗耗时 {processing_text}</div>
       <div class="stem-note">设备打开 {snapshot['device_open_count']} 次 · 自动恢复 {snapshot['device_recoveries']} 次 · 分轨跳窗至 {snapshot['skipped_sequence']} · 设备缓冲 {snapshot['device_buffer_ms']:g} ms · 累计欠载 {snapshot['underruns']} 次{underrun_event_text}</div>
+      <div class="stem-note">{device_network_text}</div>
       <div class="stem-note">混音控制 {snapshot['mixer_updates']} 次 · 最近 {snapshot['last_mixer_control_latency_ms']:g} ms · 最慢 {snapshot['max_mixer_control_latency_ms']:g} ms · {snapshot['gain_smoothing_ms']:g} ms 平滑</div>
       <div class="stem-note">相邻结果按同一时间轴交叠 {snapshot['overlap_milliseconds']:g} ms 后平滑拼接</div>
       <div class="stem-note">{gain_text}</div>
@@ -848,6 +921,7 @@ def write_command(
     process_id: int | None = None,
     monitor_stem: str = "instrumental",
     profile_name: str = "人声 / 伴奏 · 高质量",
+    device_endpoint: str = "",
 ) -> int:
     if action not in {"start", "start_airplay", "stop", "open_audio_settings"}:
         raise ValueError("未知实时控制命令。")
@@ -868,6 +942,9 @@ def write_command(
         payload["monitor_stem"] = monitor_stem
         payload["profile_name"] = profile_name
         payload["track_count"] = len(profile.stems)
+        normalized_device_endpoint = _normalize_device_endpoint(device_endpoint)
+        if normalized_device_endpoint:
+            payload["device_endpoint"] = normalized_device_endpoint
         if action == "start_airplay":
             payload["input_source"] = "airplay"
     destination = root / "command.json"

@@ -168,6 +168,7 @@ def restore_live_controls():
     restored = live_ui_defaults(LIVE_DIR)
     input_source = restored["input_source"]
     profile_name = restored["profile_name"]
+    device_endpoint = restored["device_endpoint"]
     gains = restored["gains"]
     visibility = active_stem_visibility(profile_name)
     process_choices = read_processes(LIVE_DIR) if input_source == "process" else []
@@ -180,6 +181,7 @@ def restore_live_controls():
             visible=input_source == "process",
         ),
         gr.Dropdown(value=profile_name),
+        gr.Textbox(value=device_endpoint),
         *(
             gr.Slider(
                 value=round(gains[stem] * 100),
@@ -199,6 +201,7 @@ def start_live_capture(
     input_source: str,
     process_id: int | None,
     profile_name: str,
+    device_endpoint: str,
     vocals: float,
     instrumental: float,
     drums: float,
@@ -227,6 +230,7 @@ def start_live_capture(
             None if input_source == "airplay" else process_id,
             monitor_stem=LIVE_PROFILES[profile_name].stems[0],
             profile_name=profile_name,
+            device_endpoint=device_endpoint,
         )
         latency = {
             "人声 / 伴奏 · 高质量": "约 25–30 秒",
@@ -260,6 +264,7 @@ def build_app() -> gr.Blocks:
     initial_live = live_ui_defaults(LIVE_DIR)
     initial_source = initial_live["input_source"]
     initial_profile = initial_live["profile_name"]
+    initial_device_endpoint = initial_live["device_endpoint"]
     initial_gains = initial_live["gains"]
     with gr.Blocks(title="Stem Studio") as app:
         gr.HTML(
@@ -295,6 +300,12 @@ def build_app() -> gr.Blocks:
                     ],
                     value=initial_profile,
                     label="实时分离模式",
+                )
+                device_endpoint = gr.Textbox(
+                    value=initial_device_endpoint,
+                    label="黄山派网络输出（可选）",
+                    placeholder="例如 192.168.31.88:4010；留空仅在电脑播放",
+                    info="填写黄山派的 IPv4 和固件监听 UDP 端口。改变地址只重启音频输出，不会断开手机 AirPlay。",
                 )
                 gr.Markdown("#### 实时多轨混音\n拖动任一滑杆会在不中断声卡输出的情况下平滑更新混音。")
                 initial_visibility = active_stem_visibility(initial_profile)
@@ -350,7 +361,13 @@ def build_app() -> gr.Blocks:
                 )
                 app.load(
                     restore_live_controls,
-                    outputs=[input_source, live_process, live_profile, *mixer_outputs],
+                    outputs=[
+                        input_source,
+                        live_process,
+                        live_profile,
+                        device_endpoint,
+                        *mixer_outputs,
+                    ],
                     queue=False,
                 )
                 for slider in mixer_sliders:
@@ -363,7 +380,13 @@ def build_app() -> gr.Blocks:
                     )
                 start_live.click(
                     start_live_capture,
-                    inputs=[input_source, live_process, live_profile, *mixer_sliders],
+                    inputs=[
+                        input_source,
+                        live_process,
+                        live_profile,
+                        device_endpoint,
+                        *mixer_sliders,
+                    ],
                     outputs=live_status,
                 )
                 stop_live.click(stop_live_capture, outputs=live_status)

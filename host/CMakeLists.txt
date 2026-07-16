@@ -14,6 +14,7 @@ add_library(stem_host_core STATIC
     src/audio_window_buffer.cpp
     src/center_suppressor.cpp
     src/device_audio_protocol.cpp
+    src/device_audio_queue.cpp
     src/live_paths.cpp
     src/mixer_control.cpp
     src/pcm_window_publisher.cpp
@@ -29,11 +30,12 @@ target_compile_definitions(stem_host_core PRIVATE UNICODE _UNICODE NOMINMAX WIN3
 target_compile_options(stem_host_core PRIVATE /W4 /permissive- /EHsc)
 
 add_executable(stem-studio-audio-host
+    src/device_udp_sender.cpp
     src/main.cpp
     src/process_loopback_capture.cpp
     src/wasapi_stem_renderer.cpp
 )
-target_link_libraries(stem-studio-audio-host PRIVATE stem_host_core mmdevapi ole32 avrt winmm)
+target_link_libraries(stem-studio-audio-host PRIVATE stem_host_core mmdevapi ole32 avrt winmm ws2_32)
 target_compile_definitions(stem-studio-audio-host PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_compile_options(stem-studio-audio-host PRIVATE /W4 /permissive- /EHsc)
 
@@ -92,6 +94,20 @@ add_executable(device_audio_protocol_tests tests/device_audio_protocol_tests.cpp
 target_link_libraries(device_audio_protocol_tests PRIVATE stem_host_core)
 target_compile_options(device_audio_protocol_tests PRIVATE /W4 /permissive- /EHsc)
 add_test(NAME device_audio_protocol_tests COMMAND device_audio_protocol_tests)
+
+add_executable(device_audio_queue_tests tests/device_audio_queue_tests.cpp)
+target_link_libraries(device_audio_queue_tests PRIVATE stem_host_core)
+target_compile_options(device_audio_queue_tests PRIVATE /W4 /permissive- /EHsc)
+add_test(NAME device_audio_queue_tests COMMAND device_audio_queue_tests)
+
+add_executable(device_udp_sender_tests
+    tests/device_udp_sender_tests.cpp
+    src/device_udp_sender.cpp
+)
+target_link_libraries(device_udp_sender_tests PRIVATE stem_host_core ws2_32)
+target_compile_definitions(device_udp_sender_tests PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_options(device_udp_sender_tests PRIVATE /W4 /permissive- /EHsc)
+add_test(NAME device_udp_sender_tests COMMAND device_udp_sender_tests)
 
 add_executable(stem_host_tone_player tests/tone_player.cpp)
 target_link_libraries(stem_host_tone_player PRIVATE winmm)

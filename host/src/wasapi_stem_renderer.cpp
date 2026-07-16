@@ -103,11 +103,13 @@ WasapiStemRenderer::WasapiStemRenderer(
     const std::uint32_t sample_rate,
     const std::uint16_t channels,
     SynchronizedStemBuffer& buffer,
-    const std::size_t smoothing_frames)
+    const std::size_t smoothing_frames,
+    DeviceAudioPacketQueue* const device_queue)
     : sample_rate_{sample_rate},
       channels_{channels},
       buffer_{buffer},
-      mixer_{channels, smoothing_frames} {
+      mixer_{channels, smoothing_frames},
+      device_queue_{device_queue} {
     if (sample_rate_ == 0 || channels_ == 0 || buffer_.channels() != channels_) {
         throw std::invalid_argument("WASAPI renderer geometry mismatch");
     }
@@ -203,6 +205,7 @@ void WasapiStemRenderer::run(const std::atomic_bool& stop_requested) {
             read_views.reserve(active_stems.size());
             mix_views.reserve(active_stems.size());
             const auto maximum_samples = static_cast<std::size_t>(device_buffer_frames) * channels_;
+            std::vector<std::int16_t> device_silence(maximum_samples, std::int16_t{0});
             for (const auto id : active_stems) {
                 auto& samples = scratch.at(index_for(id));
                 samples.resize(maximum_samples);
@@ -241,14 +244,23 @@ void WasapiStemRenderer::run(const std::atomic_bool& stop_requested) {
                 state_.store(read_state, std::memory_order_release);
                 DWORD release_flags = AUDCLNT_BUFFERFLAGS_SILENT;
                 if (read_state == BufferReadState::audio) {
+                    const auto mixed_output = std::span{
+                        reinterpret_cast<std::int16_t*>(device_data),
+                        sample_count};
                     mixer_.mix(
                         mix_views,
-                        std::span{
-                            reinterpret_cast<std::int16_t*>(device_data),
-                            sample_count});
+                        mixed_output);
+                    if (device_queue_ != nullptr) {
+                        (void)device_queue_->try_submit(mixed_output, false);
+                    }
                     release_flags = 0;
                     rendered_audio_frames_.fetch_add(frame_count, std::memory_order_relaxed);
                 } else {
+                    if (device_queue_ != nullptr) {
+                        (void)device_queue_->try_submit(
+                            std::span<const std::int16_t>{device_silence}.first(sample_count),
+                            true);
+                    }
                     rendered_silence_frames_.fetch_add(frame_count, std::memory_order_relaxed);
                 }
                 require_success(

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "device_audio_queue.h"
 #include "stem_mixer.h"
 #include "stem_stream_buffer.h"
 
@@ -28,7 +29,8 @@ public:
         std::uint32_t sample_rate,
         std::uint16_t channels,
         SynchronizedStemBuffer& buffer,
-        std::size_t smoothing_frames);
+        std::size_t smoothing_frames,
+        DeviceAudioPacketQueue* device_queue = nullptr);
 
     void set_gain(StemId id, float gain);
     void run(const std::atomic_bool& stop_requested);
@@ -41,6 +43,7 @@ private:
     std::uint16_t channels_;
     SynchronizedStemBuffer& buffer_;
     RealtimeStemMixer mixer_;
+    DeviceAudioPacketQueue* device_queue_;
     std::array<std::atomic<float>, stem_id_count> target_gains_{};
 
     std::atomic<std::uint64_t> device_open_count_{0};

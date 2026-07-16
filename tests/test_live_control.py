@@ -674,6 +674,42 @@ def test_live_dashboard_synchronizes_cached_lyrics_to_airplay_position(
     assert "stem-lyrics-current" in dashboard
 
 
+def test_live_dashboard_renders_smooth_audio_reactive_orb_and_waveform(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(live_control_module.time, "monotonic", lambda: 0.0)
+    (tmp_path / "airplay-status.json").write_text(
+        json.dumps(
+            {
+                "state": "streaming",
+                "codec": "ALAC",
+                "peak_left": 0.8,
+                "peak_right": 0.6,
+                "rms_left": 0.4,
+                "rms_right": 0.2,
+                "waveform": [index / 63 for index in range(64)],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    dashboard = live_dashboard_html(tmp_path)
+
+    assert 'class="stem-orb"' in dashboard
+    assert 'role="img"' in dashboard
+    assert 'aria-label="音频能量可视球，当前强度 44%"' in dashboard
+    assert "stem-orb-core" in dashboard
+    assert "stem-orb-halo" in dashboard
+    assert "stem-orb-ring" in dashboard
+    assert "@keyframes stem-orb-breathe" in dashboard
+    assert "@keyframes stem-wave-flow" in dashboard
+    assert "transform:scaleY(var(--wave-low))" in dashboard
+    assert "animation-delay:-0.11s" in dashboard
+    assert dashboard.count('<i style="--wave-low:') == 32
+    assert "@media (prefers-reduced-motion:reduce)" in dashboard
+    assert "animation:none!important" in dashboard
+
+
 def test_live_dashboard_never_reuses_stale_lyrics_after_track_revision_changes(
     tmp_path: Path,
 ) -> None:

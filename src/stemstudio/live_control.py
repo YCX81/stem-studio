@@ -556,9 +556,22 @@ def live_pipeline_snapshot(live_root: str | Path) -> dict:
 def live_dashboard_html(live_root: str | Path) -> str:
     snapshot = live_pipeline_snapshot(live_root)
     waveform = snapshot["waveform"] or [0.0] * 32
-    bars = "".join(
-        f'<i style="height:{max(4, round(value * 100))}%"></i>' for value in waveform
-    )
+    if len(waveform) > 40:
+        waveform = waveform[::2]
+    wave_clock = time.monotonic()
+
+    def wave_bar(index: int, value: float) -> str:
+        speed = 0.72 + (index % 5) * 0.09
+        phase = (wave_clock + index * 0.11) % (2 * speed)
+        return (
+            '<i style="'
+            f'--wave-low:{max(0.04, value * 0.58):.3f};'
+            f'--wave-high:{max(0.08, value):.3f};'
+            f'--wave-speed:{speed:.2f}s;'
+            f'animation-delay:-{phase:.2f}s"></i>'
+        )
+
+    bars = "".join(wave_bar(index, value) for index, value in enumerate(waveform))
     streaming = snapshot["streaming"]
     stream_stalled = snapshot["stream_stalled"]
     controller_stalled = snapshot["controller_stalled"]
@@ -579,6 +592,31 @@ def live_dashboard_html(live_root: str | Path) -> str:
         else "上游 PCM 已停止"
         if stream_stalled
         else "等待 AirPlay 音频"
+    )
+    average_rms = (snapshot["rms_left"] + snapshot["rms_right"]) / 2.0
+    average_peak = (snapshot["peak_left"] + snapshot["peak_right"]) / 2.0
+    visual_energy = min(1.0, max(0.0, average_rms * 0.65 + average_peak * 0.35))
+    if not streaming:
+        visual_energy = 0.04
+    energy_percent = round(visual_energy * 100)
+    stereo_balance = min(
+        1.0,
+        max(-1.0, snapshot["rms_right"] - snapshot["rms_left"]),
+    )
+    orb_speed = max(1.45, 3.15 - visual_energy * 1.55)
+    orb_style = (
+        f"--orb-core-low:{0.90 + visual_energy * 0.08:.3f};"
+        f"--orb-core-high:{1.00 + visual_energy * 0.12:.3f};"
+        f"--orb-halo-low:{0.94 + visual_energy * 0.08:.3f};"
+        f"--orb-halo-high:{1.08 + visual_energy * 0.18:.3f};"
+        f"--orb-shift:{stereo_balance * 12.0:.1f}px;"
+        f"--orb-shift-reverse:{stereo_balance * -12.0:.1f}px;"
+        f"--orb-speed:{orb_speed:.2f}s;"
+        f"--orb-morph-speed:{orb_speed * 1.17:.2f}s;"
+        f"--orb-drift-speed:{orb_speed * 0.83:.2f}s;"
+        f"--orb-ring-speed:{orb_speed * 1.80:.2f}s;"
+        f"--orb-ring-secondary-speed:{orb_speed * 1.35:.2f}s;"
+        f"--orb-glow:{18 + energy_percent // 2}px"
     )
     processing = snapshot["processing_seconds"]
     cache_hit_labels = {
@@ -848,8 +886,26 @@ def live_dashboard_html(live_root: str | Path) -> str:
     .stem-chip.ok{{background:#123c2b;color:#79f2b2}} .stem-chip.idle{{color:#aab3c5}}
     .stem-track{{display:flex;justify-content:space-between;gap:12px;align-items:end;background:#171b24;border-radius:10px;padding:10px 12px;margin-bottom:12px}}
     .stem-track b{{display:block;font-size:14px}} .stem-track small{{color:#8e99ad!important}} .stem-track time{{white-space:nowrap;color:#a5b4fc!important;font-size:12px}}
-    .stem-wave{{height:92px;display:flex;align-items:center;gap:3px;background:#0a0c11;border-radius:10px;padding:10px;overflow:hidden}}
-    .stem-wave i{{display:block;flex:1;min-width:2px;max-height:100%;border-radius:3px;background:linear-gradient(180deg,#67e8f9,#8b5cf6);opacity:.9}}
+    .stem-visuals{{display:grid;grid-template-columns:210px 1fr;gap:12px;align-items:stretch}}
+    .stem-orb-panel,.stem-wave-panel{{position:relative;background:radial-gradient(circle at 50% 20%,#151b2b,#090b10 72%);border:1px solid #202737;border-radius:14px;overflow:hidden}}
+    .stem-orb-panel{{min-height:168px;display:grid;place-items:center;padding:12px}}
+    .stem-orb{{position:relative;width:126px;height:126px;isolation:isolate;transform:translateZ(0)}}
+    .stem-orb span{{position:absolute;inset:0;display:block}}
+    .stem-orb-halo{{border-radius:43% 57% 52% 48%/49% 43% 57% 51%;background:radial-gradient(circle at 32% 28%,rgba(103,232,249,.88),rgba(139,92,246,.62) 38%,rgba(236,72,153,.28) 60%,transparent 73%);filter:blur(9px);opacity:.8;animation:stem-orb-breathe var(--orb-speed) ease-in-out infinite;transform:translate3d(var(--orb-shift),0,0) scale(var(--orb-halo-low))}}
+    .stem-orb-core{{inset:13px!important;border-radius:48% 52% 44% 56%/53% 42% 58% 47%!important;background:conic-gradient(from 210deg,#22d3ee,#6366f1 24%,#a855f7 48%,#ec4899 68%,#38bdf8 86%,#22d3ee);box-shadow:0 0 var(--orb-glow) rgba(99,102,241,.62),inset -18px -14px 28px rgba(7,9,18,.42),inset 12px 10px 24px rgba(255,255,255,.24);animation:stem-orb-morph var(--orb-morph-speed) ease-in-out infinite alternate;transform:scale(var(--orb-core-low)) rotate(-5deg)}}
+    .stem-orb-sheen{{inset:24px 31px 59px 29px!important;border-radius:50%!important;background:radial-gradient(circle,rgba(255,255,255,.85),rgba(165,243,252,.2) 58%,transparent 72%);filter:blur(2px);opacity:.72;animation:stem-orb-drift var(--orb-drift-speed) ease-in-out infinite alternate}}
+    .stem-orb-ring{{inset:-6px!important;border:1px solid rgba(165,180,252,.34);border-radius:46% 54% 58% 42%/44% 51% 49% 56%!important;animation:stem-orb-ring var(--orb-ring-speed) linear infinite}}
+    .stem-orb-ring.secondary{{inset:5px!important;border-color:rgba(103,232,249,.2);animation-direction:reverse;animation-duration:var(--orb-ring-secondary-speed)}}
+    .stem-orb-caption{{position:absolute;bottom:8px;color:#8e99ad!important;font-size:10px;letter-spacing:.06em}}
+    .stem-wave-panel{{padding:12px;min-width:0}}
+    .stem-wave-title{{display:flex;justify-content:space-between;color:#8e99ad!important;font-size:11px;margin-bottom:8px}}
+    .stem-wave{{height:116px;display:flex;align-items:center;gap:3px;overflow:hidden}}
+    .stem-wave i{{display:block;flex:1;min-width:2px;height:100%;border-radius:999px;background:linear-gradient(180deg,#67e8f9,#8b5cf6 58%,#ec4899);opacity:.9;transform-origin:center;transform:scaleY(var(--wave-low));animation:stem-wave-flow var(--wave-speed) ease-in-out infinite alternate}}
+    @keyframes stem-wave-flow{{from{{transform:scaleY(var(--wave-low));opacity:.58}}to{{transform:scaleY(var(--wave-high));opacity:1}}}}
+    @keyframes stem-orb-breathe{{0%,100%{{transform:translate3d(var(--orb-shift),0,0) scale(var(--orb-halo-low)) rotate(-4deg);opacity:.64}}50%{{transform:translate3d(var(--orb-shift-reverse),-2px,0) scale(var(--orb-halo-high)) rotate(7deg);opacity:.94}}}}
+    @keyframes stem-orb-morph{{0%{{transform:scale(var(--orb-core-low)) rotate(-5deg)}}100%{{transform:scale(var(--orb-core-high)) rotate(7deg)}}}}
+    @keyframes stem-orb-drift{{from{{transform:translate3d(-8px,-3px,0) scale(.88);opacity:.5}}to{{transform:translate3d(12px,9px,0) scale(1.08);opacity:.9}}}}
+    @keyframes stem-orb-ring{{to{{transform:rotate(360deg) scale(var(--orb-halo-high))}}}}
     .stem-lyrics{{margin-top:12px;background:#171b24;border-radius:12px;padding:13px;text-align:center;min-height:96px}}
     .stem-lyrics h4{{font-size:12px;color:#aab3c5!important;margin:0 0 10px;text-align:left}}
     .stem-lyrics-context{{color:#7d879a!important;font-size:12px;line-height:1.7;white-space:pre-wrap}}
@@ -857,16 +913,26 @@ def live_dashboard_html(live_root: str | Path) -> str:
     .stem-lyrics-empty{{color:#8e99ad!important;font-size:13px;padding:18px 0}}
     .stem-grid{{display:grid;grid-template-columns:1.2fr 1fr;gap:14px;margin-top:14px}} .stem-card{{background:#171b24;border-radius:12px;padding:13px}}
     .stem-card h4{{font-size:12px;color:#aab3c5!important;margin:0 0 10px}} .meter{{color:#eef2ff!important;display:grid;grid-template-columns:14px 1fr 38px;gap:8px;align-items:center;margin:7px 0;font-size:12px}}
-    .meter span{{height:8px;background:#2b3140;border-radius:8px;overflow:hidden}} .meter b{{display:block;height:100%;background:#22d3ee;border-radius:8px}} .meter em{{font-style:normal;color:#aab3c5!important;text-align:right}}
+    .meter span{{height:8px;background:#2b3140;border-radius:8px;overflow:hidden}} .meter b{{display:block;height:100%;background:#22d3ee;border-radius:8px;transition:width .18s ease-out}} .meter em{{font-style:normal;color:#aab3c5!important;text-align:right}}
     .pipe{{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}} .pipe div{{background:#0e1118;border-radius:9px;padding:9px}}
     .pipe b{{display:block;font-size:18px}} .pipe small{{color:#8e99ad!important}} .continuity{{margin-top:12px;border-radius:10px;padding:10px 12px;font-size:13px}}
     .continuity.warm{{background:#392f13;color:#fde68a}} .continuity.bad{{background:#431b22;color:#fda4af}} .continuity.idle{{background:#222735;color:#b7c0d2}}
     .continuity.ok{{background:#123c2b;color:#79f2b2}}
-    .stem-note{{margin-top:10px;color:#8e99ad!important;font-size:12px}} @media(max-width:720px){{.stem-grid{{grid-template-columns:1fr}}}}
+    .stem-note{{margin-top:10px;color:#8e99ad!important;font-size:12px}}
+    @media(max-width:720px){{.stem-grid{{grid-template-columns:1fr}}.stem-visuals{{grid-template-columns:1fr}}.stem-orb-panel{{min-height:158px}}}}
+    @media (prefers-reduced-motion:reduce){{.stem-orb span,.stem-wave i{{animation:none!important}}.meter b{{transition:none}}}}
   </style>
   <div class="stem-head"><strong>实时输入电平</strong><span class="stem-chip {state_class}">{state_text} · {html.escape(snapshot['codec'])}</span></div>
   <div class="stem-track"><div><b>{title}</b><small>{track_details or '内容指纹将在收到音频后确认'}</small></div><time>{progress}</time></div>
-  <div class="stem-wave">{bars}</div>
+  <div class="stem-visuals">
+    <div class="stem-orb-panel">
+      <div class="stem-orb" role="img" aria-label="音频能量可视球，当前强度 {energy_percent}%" style="{orb_style}">
+        <span class="stem-orb-halo"></span><span class="stem-orb-ring"></span><span class="stem-orb-ring secondary"></span><span class="stem-orb-core"></span><span class="stem-orb-sheen"></span>
+      </div>
+      <small class="stem-orb-caption">AUDIO ENERGY · {energy_percent}%</small>
+    </div>
+    <div class="stem-wave-panel"><div class="stem-wave-title"><span>平滑实时波形</span><span>浏览器合成动画</span></div><div class="stem-wave">{bars}</div></div>
+  </div>
   <div class="stem-lyrics"><h4>同步歌词 · {lyrics_source}</h4>{lyrics_body}</div>
   <div class="stem-grid">
     <div class="stem-card">

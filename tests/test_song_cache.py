@@ -179,6 +179,46 @@ def test_song_cache_lookup_tolerates_subsecond_airplay_duration_drift(
     assert cache.lookup(different_duration, _profile()) == []
 
 
+def test_song_cache_lookup_can_opt_into_stale_airplay_duration_candidates(
+    tmp_path: Path,
+) -> None:
+    cache = SongCache(tmp_path / "songs")
+    entry = _build_song(cache, "stale-duration")
+    assert entry is not None
+    stale_duration = SongTrackMetadata(
+        title="Same Song",
+        artist="Artist",
+        album="Album",
+        duration_frames=120,
+        sample_rate=10,
+    )
+    wrong_album = SongTrackMetadata(
+        title="Same Song",
+        artist="Artist",
+        album="Different Album",
+        duration_frames=120,
+        sample_rate=10,
+    )
+
+    assert cache.lookup(stale_duration, _profile()) == []
+    assert [
+        item.cache_key
+        for item in cache.lookup(
+            stale_duration,
+            _profile(),
+            allow_duration_mismatch=True,
+        )
+    ] == [entry.cache_key]
+    assert (
+        cache.lookup(
+            wrong_album,
+            _profile(),
+            allow_duration_mismatch=True,
+        )
+        == []
+    )
+
+
 def test_song_cache_default_alignment_covers_large_airplay_anchor_correction(
     tmp_path: Path,
 ) -> None:

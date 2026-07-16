@@ -587,7 +587,11 @@ class LiveWorker:
                     group_frames,
                 )
                 matched = None
-                for entry in self._song_cache.lookup(metadata, profile):
+                for entry in self._song_cache.lookup(
+                    metadata,
+                    profile,
+                    allow_duration_mismatch=True,
+                ):
                     aligned = entry.align_source(
                         source_pcm,
                         approximate_track_start_frame=first.track_start_frame,

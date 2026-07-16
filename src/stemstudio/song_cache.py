@@ -94,7 +94,7 @@ class SongTrackMetadata:
         return hashlib.sha256(_canonical_json(payload)).hexdigest()
 
 
-def _metadata_matches_airplay_revision(
+def _metadata_track_text_matches_airplay_revision(
     cached: SongTrackMetadata,
     requested: SongTrackMetadata,
 ) -> bool:
@@ -103,6 +103,15 @@ def _metadata_matches_airplay_revision(
         and _normalized_text(cached.title) == _normalized_text(requested.title)
         and _normalized_text(cached.artist) == _normalized_text(requested.artist)
         and _normalized_text(cached.album) == _normalized_text(requested.album)
+    )
+
+
+def _metadata_matches_airplay_revision(
+    cached: SongTrackMetadata,
+    requested: SongTrackMetadata,
+) -> bool:
+    return (
+        _metadata_track_text_matches_airplay_revision(cached, requested)
         and abs(cached.duration_frames - requested.duration_frames)
         <= requested.sample_rate // 2
     )
@@ -764,6 +773,8 @@ class SongCache:
         self,
         metadata: SongTrackMetadata,
         profile: SongCacheProfile,
+        *,
+        allow_duration_mismatch: bool = False,
     ) -> list[SongCacheEntry]:
         with self._lock:
             candidates: list[tuple[int, SongCacheEntry]] = []
@@ -778,7 +789,16 @@ class SongCache:
                     ):
                         continue
                     entry = self._entry_from_payload(manifest_path, payload)
-                    if not _metadata_matches_airplay_revision(entry.metadata, metadata):
+                    if not (
+                        _metadata_matches_airplay_revision(entry.metadata, metadata)
+                        or (
+                            allow_duration_mismatch
+                            and _metadata_track_text_matches_airplay_revision(
+                                entry.metadata,
+                                metadata,
+                            )
+                        )
+                    ):
                         continue
                 except (KeyError, TypeError, ValueError):
                     shutil.rmtree(manifest_path.parent, ignore_errors=True)

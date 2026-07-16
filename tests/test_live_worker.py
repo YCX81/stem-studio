@@ -709,7 +709,7 @@ def test_live_worker_uses_song_cache_at_non_window_aligned_position(tmp_path: Pa
     assert manifest["cached_start_frame"] == 30
 
 
-def test_live_worker_replays_after_airplay_duration_and_anchor_resync_without_gpu(
+def test_live_worker_replays_after_stale_airplay_duration_and_anchor_resync_without_gpu(
     tmp_path: Path,
 ) -> None:
     config = LiveConfig(
@@ -762,10 +762,10 @@ def test_live_worker_replays_after_airplay_duration_and_anchor_resync_without_gp
         "has_progress": True,
         "start_rtp": 10_000,
         "current_rtp": 10_000,
-        "end_rtp": 10_079,
+        "end_rtp": 10_120,
         "anchor_stream_frame": 0,
         "track_position_frame": 0,
-        "track_duration_frame": 79,
+        "track_duration_frame": 120,
         "title": "AirPlay Resync Song",
         "artist": "Artist",
         "album": "Album",

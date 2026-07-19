@@ -91,13 +91,13 @@ def _inference_timeout(environ: Mapping[str, str]) -> float:
         environ, "STEM_STUDIO_INFERENCE_TIMEOUT_SECONDS"
     )
     if not raw_value or raw_value.casefold() == "auto":
-        return 2.8
+        return 5.5
     try:
         value = float(raw_value)
     except ValueError as exc:
-        raise ValueError("实时推理截止时间必须是 1.0 到 2.9 秒。") from exc
-    if not math.isfinite(value) or not 1.0 <= value <= 2.9:
-        raise ValueError("3 秒步进的实时推理截止时间必须小于 3 秒。")
+        raise ValueError("实时推理截止时间必须是 1.0 到 10.0 秒。") from exc
+    if not math.isfinite(value) or not 1.0 <= value <= 10.0:
+        raise ValueError("实时推理截止时间必须在 1.0 到 10.0 秒之间。")
     return round(value, 3)
 
 
@@ -129,8 +129,8 @@ def detect_hardware_config(
             gpu_concurrency=1,
             live_hop_seconds=3,
             demucs_shifts=1,
-            shifts_benchmark_limit_seconds=2.4,
-            inference_timeout_seconds=2.8,
+            shifts_benchmark_limit_seconds=2.0,
+            inference_timeout_seconds=5.5,
             warnings=("容器未检测到可用 CUDA GPU。",),
         )
 
@@ -155,7 +155,7 @@ def detect_hardware_config(
         gpu_concurrency=_gpu_concurrency(resolved_environment, vram_gb),
         live_hop_seconds=3,
         demucs_shifts=2 if vram_gb >= 15.0 else 1,
-        shifts_benchmark_limit_seconds=2.4,
+        shifts_benchmark_limit_seconds=2.0,
         inference_timeout_seconds=_inference_timeout(resolved_environment),
         warnings=warnings,
     )

@@ -104,7 +104,7 @@ def test_live_worker_status_is_atomically_parseable(tmp_path: Path) -> None:
     assert payload["state"] == "waiting"
     assert payload["last_sequence"] == 3
     assert payload["model_state"] == "stopped"
-    assert payload["inference_timeout_seconds"] == 2.8
+    assert payload["inference_timeout_seconds"] == 5.5
     assert not (tmp_path / "gpu-status.json.part").exists()
 
 
@@ -447,7 +447,7 @@ def test_six_track_failure_fallback_keeps_original_mix_in_other_stem(
         assert pcm == expected
 
 
-def test_failure_fallback_uses_loudest_active_stem_when_other_is_muted(
+def test_failure_fallback_stays_on_designated_stem_when_its_fader_is_muted(
     tmp_path: Path,
 ) -> None:
     inbox = tmp_path / "inbox"
@@ -489,8 +489,8 @@ def test_failure_fallback_uses_loudest_active_stem_when_other_is_muted(
     result = worker.process_available(max_chunks=1)[0]
     manifest = json.loads(result.manifest.read_text(encoding="utf-8"))
 
-    assert manifest["fallback_stem"] == "vocals"
-    assert manifest["fallback_output_gain"] == 0.8
+    assert manifest["fallback_stem"] == "other"
+    assert manifest["fallback_output_gain"] == 1.0
 
 
 def test_live_worker_status_counts_fallback_windows_as_degraded_but_playable(
@@ -567,6 +567,95 @@ def test_live_worker_uses_original_mix_to_drain_realtime_backlog_before_gpu(
     assert (inbox / "capture-00000002.wav").is_file()
 
 
+def test_realtime_backlog_fallback_keeps_resident_separator_alive(
+    tmp_path: Path,
+) -> None:
+    inbox = tmp_path / "inbox"
+    inbox.mkdir(parents=True)
+    for sequence in (1, 2):
+        _write_audio(inbox / f"capture-{sequence:08d}.wav", 80)
+    (tmp_path / "playback-status.json").write_text(
+        json.dumps(
+            {
+                "state": "playing",
+                "buffered_seconds": 3.0,
+                "gains": {"vocals": 1.0, "instrumental": 1.0},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class ResidentSeparator:
+        def __init__(self) -> None:
+            self.close_count = 0
+
+        def separate(self, _source: Path) -> list[Path]:
+            raise AssertionError("backlog fallback must run before inference")
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    separator = ResidentSeparator()
+    worker = LiveWorker(tmp_path, separator_factory=lambda _profile: separator)
+    worker.config = LiveConfig(
+        sample_rate=10,
+        window_seconds=8,
+        hop_seconds=2,
+        stable_offset_seconds=3,
+    )
+    worker._processor = worker._create_processor(separator)
+
+    result = worker.process_available(max_chunks=1)[0]
+
+    manifest = json.loads(result.manifest.read_text(encoding="utf-8"))
+    assert manifest["fallback_reason"] == "realtime_backlog"
+    assert worker._processor is not None
+    assert separator.close_count == 0
+
+
+def test_silent_windows_capture_keeps_resident_separator_alive(tmp_path: Path) -> None:
+    inbox = tmp_path / "inbox"
+    inbox.mkdir(parents=True)
+    _write_audio(inbox / "capture-00000001.wav", 80)
+    (tmp_path / "capture-input-status.json").write_text(
+        json.dumps(
+            {
+                "state": "capturing",
+                "source": "windows",
+                "signal_detected": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class ResidentSeparator:
+        def __init__(self) -> None:
+            self.close_count = 0
+
+        def separate(self, _source: Path) -> list[Path]:
+            raise AssertionError("silent input must not enter inference")
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    separator = ResidentSeparator()
+    worker = LiveWorker(tmp_path, separator_factory=lambda _profile: separator)
+    worker.config = LiveConfig(
+        sample_rate=10,
+        window_seconds=8,
+        hop_seconds=2,
+        stable_offset_seconds=3,
+    )
+    worker._processor = worker._create_processor(separator)
+
+    result = worker.process_available(max_chunks=1)[0]
+
+    manifest = json.loads(result.manifest.read_text(encoding="utf-8"))
+    assert manifest["fallback_reason"] == "input_silence"
+    assert worker._processor is not None
+    assert separator.close_count == 0
+
+
 def test_live_worker_uses_original_mix_before_gpu_when_buffer_is_below_deadline_reserve(
     tmp_path: Path,
 ) -> None:
@@ -579,7 +668,7 @@ def test_live_worker_uses_original_mix_before_gpu_when_buffer_is_below_deadline_
                 "state": "playing",
                 "sequence": 1,
                 "queued_sequence": 0,
-                "buffered_seconds": 6.0,
+                "buffered_seconds": 2.0,
                 "gains": {"vocals": 1.0, "instrumental": 1.0},
             }
         ),
@@ -609,7 +698,7 @@ def test_live_worker_uses_original_mix_before_gpu_when_buffer_is_below_deadline_
     worker._write_status({})
     status = json.loads((tmp_path / "gpu-status.json").read_text(encoding="utf-8"))
     assert status["low_buffer_fallback_windows"] == 1
-    assert status["continuity_reserve_seconds"] == 6.5
+    assert status["continuity_reserve_seconds"] == 3.0
 
 
 def test_live_worker_reuses_content_cache_without_running_separator_again(tmp_path: Path) -> None:
@@ -665,6 +754,60 @@ def test_live_worker_reuses_content_cache_without_running_separator_again(tmp_pa
     assert manifest["processing_seconds"] == 0.0
     assert set(manifest["stems"]) == {"vocals", "instrumental"}
     assert list((tmp_path / "cache").glob("*/*/manifest.json"))
+
+
+def test_windows_live_capture_bypasses_window_cache_to_protect_deadline(
+    tmp_path: Path,
+) -> None:
+    inbox = tmp_path / "inbox"
+    inbox.mkdir(parents=True)
+    _write_audio(inbox / "capture-00000001.wav", 80)
+    (tmp_path / "capture-input-status.json").write_text(
+        json.dumps(
+            {
+                "state": "capturing",
+                "source": "windows",
+                "signal_detected": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    calls: list[str] = []
+
+    class CountingSeparator:
+        def separate(self, source: Path) -> list[Path]:
+            calls.append(source.name)
+            outputs = []
+            for stem in ("Vocals", "Drums", "Bass", "Guitar", "Piano", "Other"):
+                output = tmp_path / "work" / f"track_({stem}).wav"
+                output.parent.mkdir(exist_ok=True)
+                _write_audio(output, 80)
+                outputs.append(output)
+            return outputs
+
+    worker = LiveWorker(
+        tmp_path,
+        separator_factory=lambda _profile: CountingSeparator(),
+    )
+    worker.config = LiveConfig(
+        sample_rate=10,
+        window_seconds=8,
+        hop_seconds=2,
+        stable_offset_seconds=3,
+    )
+
+    assert [result.sequence for result in worker.process_available()] == [1]
+    _write_audio(inbox / "capture-00000002.wav", 80)
+    restarted = LiveWorker(
+        tmp_path,
+        separator_factory=lambda _profile: CountingSeparator(),
+    )
+    restarted.config = worker.config
+
+    assert [result.sequence for result in restarted.process_available()] == [2]
+    assert calls == ["capture-00000001.wav", "capture-00000002.wav"]
+    assert not list((tmp_path / "cache").glob("*/*/manifest.json"))
 
 
 def test_live_worker_uses_song_cache_at_non_window_aligned_position(tmp_path: Path) -> None:

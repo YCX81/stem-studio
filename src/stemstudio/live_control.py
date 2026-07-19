@@ -109,11 +109,13 @@ def live_ui_defaults(live_root: str | Path) -> dict:
         and controller_heartbeat_age_seconds <= _CONTROLLER_HEARTBEAT_STALE_SECONDS
     )
     input_source = "process"
+    process_id: int | None = 0
     profile_name = "人声 / 伴奏 · 高质量"
     device_endpoint = ""
 
     if state == "airplay_waiting" and controller_online:
         input_source = "airplay"
+        process_id = None
         candidate = controller.get("profile_name")
         if candidate in LIVE_PROFILES:
             profile_name = str(candidate)
@@ -124,6 +126,10 @@ def live_ui_defaults(live_root: str | Path) -> dict:
         except ValueError:
             device_endpoint = ""
     elif state == "capturing" and controller_online:
+        try:
+            process_id = max(0, int(controller.get("process_id", 0) or 0))
+        except (TypeError, ValueError):
+            process_id = 0
         candidate = controller.get("profile_name")
         if candidate in LIVE_PROFILES:
             profile_name = str(candidate)
@@ -139,6 +145,13 @@ def live_ui_defaults(live_root: str | Path) -> dict:
             input_source = (
                 "airplay" if command.get("action") == "start_airplay" else "process"
             )
+            if input_source == "airplay":
+                process_id = None
+            else:
+                try:
+                    process_id = max(0, int(command.get("process_id", 0) or 0))
+                except (TypeError, ValueError):
+                    process_id = 0
             candidate = command.get("profile_name")
             if candidate in LIVE_PROFILES:
                 profile_name = str(candidate)
@@ -164,6 +177,7 @@ def live_ui_defaults(live_root: str | Path) -> dict:
                 gains[stem] = min(1.0, max(0.0, gain))
     return {
         "input_source": input_source,
+        "process_id": process_id,
         "profile_name": profile_name,
         "device_endpoint": device_endpoint,
         "gains": gains,
@@ -188,10 +202,34 @@ def live_pipeline_snapshot(live_root: str | Path) -> dict:
     airplay_path = root / "airplay-status.json"
     airplay = _read_status(airplay_path)
     airplay_status_age_seconds = _status_age_seconds(airplay_path)
-    raw_streaming = airplay.get("state") == "streaming"
+    capture_input_path = root / "capture-input-status.json"
+    capture_input = _read_status(capture_input_path)
+    capture_input_age_seconds = _status_age_seconds(capture_input_path)
+    windows_capture = controller_state == "capturing"
+    input_status = capture_input if windows_capture else airplay
+    input_status_age_seconds = (
+        capture_input_age_seconds if windows_capture else airplay_status_age_seconds
+    )
+    try:
+        source_sessions_isolated = max(
+            0, int(input_status.get("source_sessions_isolated", 0) or 0)
+        )
+    except (TypeError, ValueError):
+        source_sessions_isolated = 0
+    try:
+        source_isolation_db = float(input_status.get("source_isolation_db", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        source_isolation_db = 0.0
+    if not math.isfinite(source_isolation_db):
+        source_isolation_db = 0.0
+    raw_streaming = (
+        capture_input.get("state") == "capturing"
+        if windows_capture
+        else airplay.get("state") == "streaming"
+    )
     streaming = raw_streaming and (
-        airplay_status_age_seconds is not None
-        and airplay_status_age_seconds <= _AIRPLAY_STREAM_STALE_SECONDS
+        input_status_age_seconds is not None
+        and input_status_age_seconds <= _AIRPLAY_STREAM_STALE_SECONDS
     )
     stream_stalled = raw_streaming and not streaming
     gpu = _read_status(root / "gpu-status.json")
@@ -332,18 +370,18 @@ def live_pipeline_snapshot(live_root: str | Path) -> dict:
 
     def level(name: str) -> float:
         try:
-            return min(1.0, max(0.0, float(airplay.get(name, 0.0))))
+            return min(1.0, max(0.0, float(input_status.get(name, 0.0))))
         except (TypeError, ValueError):
             return 0.0
 
     waveform = []
-    for value in airplay.get("waveform", [])[:64]:
+    for value in input_status.get("waveform", [])[:64]:
         try:
             waveform.append(min(1.0, max(0.0, float(value))))
         except (TypeError, ValueError):
             waveform.append(0.0)
 
-    raw_track = airplay.get("track", {})
+    raw_track = input_status.get("track", {})
     track = raw_track if isinstance(raw_track, dict) else {}
     raw_device_hresult = str(playback.get("last_device_hresult", ""))
     if re.fullmatch(r"0[xX][0-9A-Fa-f]{8}", raw_device_hresult):
@@ -433,13 +471,25 @@ def live_pipeline_snapshot(live_root: str | Path) -> dict:
         ),
         "streaming": streaming,
         "stream_stalled": stream_stalled,
+        "input_source": "windows" if windows_capture else "airplay",
+        "input_scope": str(input_status.get("input_scope", "")),
+        "signal_detected": input_status.get("signal_detected") is True,
+        "source_sessions_isolated": source_sessions_isolated,
+        "source_isolation_db": source_isolation_db,
         "airplay_status_age_seconds": (
             round(airplay_status_age_seconds, 3)
             if airplay_status_age_seconds is not None
             else None
         ),
-        "codec": str(airplay.get("codec", "none")),
-        "received_seconds": round(max(0, int(airplay.get("pcm_frames", 0) or 0)) / 44_100, 1),
+        "codec": (
+            "PCM16 · Windows"
+            if windows_capture
+            else str(airplay.get("codec", "none"))
+        ),
+        "received_seconds": round(
+            max(0, int(input_status.get("pcm_frames", 0) or 0)) / 44_100,
+            1,
+        ),
         "published_windows": max(0, int(airplay.get("published_windows", 0) or 0)),
         "peak_left": level("peak_left"),
         "peak_right": level("peak_right"),
@@ -590,10 +640,18 @@ def live_dashboard_html(live_root: str | Path) -> str:
     state_text = (
         "控制器已离线"
         if controller_stalled
-        else "正在接收音频"
+        else (
+            "已捕获 Windows 音频"
+            if snapshot["input_source"] == "windows" and snapshot["signal_detected"]
+            else "Windows 捕获已启动，当前为静音"
+            if snapshot["input_source"] == "windows"
+            else "正在接收音频"
+        )
         if streaming
         else "上游 PCM 已停止"
         if stream_stalled
+        else "等待 Windows 音频"
+        if snapshot["input_source"] == "windows"
         else "等待 AirPlay 音频"
     )
     average_rms = (snapshot["rms_left"] + snapshot["rms_right"]) / 2.0
@@ -806,10 +864,20 @@ def live_dashboard_html(live_root: str | Path) -> str:
         minutes, second = divmod(remainder, 60)
         return f"{hours:d}:{minutes:02d}:{second:02d}" if hours else f"{minutes:02d}:{second:02d}"
 
-    title = html.escape(snapshot["track_title"] or "等待手机发送曲目信息")
+    default_title = (
+        "正在捕获全部 Windows 音频"
+        if snapshot["input_source"] == "windows"
+        and snapshot["input_scope"] == "system"
+        else "正在捕获 Windows 音频"
+        if snapshot["input_source"] == "windows"
+        else "等待手机发送曲目信息"
+    )
+    title = html.escape(snapshot["track_title"] or default_title)
     artist = html.escape(snapshot["track_artist"])
     album = html.escape(snapshot["track_album"])
     track_details = " · ".join(value for value in (artist, album) if value)
+    if not track_details and snapshot["input_source"] == "windows":
+        track_details = "当前播放器尚未向 Windows 媒体会话提供曲目信息"
     duration = snapshot["track_duration_seconds"]
     progress = (
         f"{clock_text(snapshot['track_position_seconds'])} / {clock_text(duration)}"
@@ -950,7 +1018,7 @@ def live_dashboard_html(live_root: str | Path) -> str:
       <h4>立体声电平</h4>
       <div class="meter">L {meter(snapshot['peak_left'])}</div>
       <div class="meter">R {meter(snapshot['peak_right'])}</div>
-      <div class="stem-note">已接收 {snapshot['received_seconds']:.1f} 秒 PCM · AirPlay 自身默认延迟约 0.25 秒</div>
+      <div class="stem-note">已接收 {snapshot['received_seconds']:.1f} 秒 PCM · {"Windows WASAPI 系统捕获" if snapshot['input_source'] == 'windows' else 'AirPlay 自身默认延迟约 0.25 秒'}</div>
     </div>
     <div class="stem-card">
       <h4>{snapshot['analysis_window_seconds']:g} 秒分析窗 / {snapshot['hop_seconds']:g} 秒步进</h4>
@@ -1060,6 +1128,7 @@ def write_mixer_percentages(
 
 
 def read_processes(live_root: str | Path) -> list[tuple[str, int]]:
+    system_choice = [("全部 Windows 音频（推荐）", 0)]
     path = Path(live_root) / "processes.json"
     if not path.is_file():
         return []
@@ -1088,9 +1157,12 @@ def read_processes(live_root: str | Path) -> list[tuple[str, int]]:
                 item[0].casefold(),
             ),
         )
-        return [(f"{title or name} · {name} · PID {pid}", pid) for name, title, pid in ordered]
+        return system_choice + [
+            (f"{title or name} · {name} · PID {pid}", pid)
+            for name, title, pid in ordered
+        ]
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
-        return []
+        return system_choice
 
 
 def write_command(
@@ -1104,8 +1176,8 @@ def write_command(
 ) -> int:
     if action not in {"start", "start_airplay", "stop", "open_audio_settings"}:
         raise ValueError("未知实时控制命令。")
-    if action == "start" and (process_id is None or int(process_id) <= 0):
-        raise ValueError("请先选择有效的音乐软件。")
+    if action == "start" and (process_id is None or int(process_id) < 0):
+        raise ValueError("请先选择有效的 Windows 音频来源。")
     if action in {"start", "start_airplay"}:
         if hop_seconds is not None and hop_seconds not in {3, 6}:
             raise ValueError("实时步进仅支持 3 秒或 6 秒。")
@@ -1221,8 +1293,13 @@ def status_markdown(live_root: str | Path) -> str:
         return "🟡 **等待手机 AirPlay** · 在控制中心选择 Stem Studio"
     if capture.get("state") == "capturing":
         profile_name = gpu.get("profile_name") or capture.get("profile_name") or "实时分离"
+        capture_label = (
+            "全部 Windows 音频"
+            if capture.get("input_scope") == "system"
+            else f"PID {capture['process_id']}"
+        )
         return (
-            f"🟢 **正在捕获 PID {capture['process_id']}** · "
+            f"🟢 **正在捕获 {capture_label}** · "
             f"{profile_name} · "
             f"GPU 已完成窗口 {gpu.get('last_sequence', 0)} · "
             f"监听 {playback.get('state', '等待')} {playback.get('sequence', '')} · "

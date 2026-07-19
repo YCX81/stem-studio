@@ -75,11 +75,17 @@ def _fake_inference_worker(connection: Connection, config: dict) -> None:
         if config.get("hang"):
             time.sleep(10.0)
             continue
+        if config.get("echo_source"):
+            source = Path(request["source"])
+            assert source.read_bytes() == b"pcm"
+            outputs = [str(source)]
+        else:
+            outputs = config["outputs"]
         connection.send(
             {
                 "kind": "result",
                 "request_id": request["request_id"],
-                "outputs": config["outputs"],
+                "outputs": outputs,
             }
         )
 
@@ -109,6 +115,25 @@ def test_isolated_separator_prewarms_without_blocking_and_returns_paths(tmp_path
     finally:
         separator.close()
     assert separator.is_alive is False
+
+
+def test_isolated_separator_stages_private_input_for_child_and_cleans_it(
+    tmp_path: Path,
+) -> None:
+    separator = _separator(tmp_path, echo_source=True)
+    source = tmp_path / "capture.wav"
+    source.write_bytes(b"pcm")
+    try:
+        assert separator.wait_until_ready(2.0) is True
+        outputs = separator.separate(source)
+    finally:
+        separator.close()
+
+    assert len(outputs) == 1
+    assert outputs[0] != source
+    assert outputs[0].name == source.name
+    assert outputs[0].exists() is False
+    assert not list((tmp_path / "work").glob(".inference-input-*"))
 
 
 def test_cuda_prewarm_runs_a_full_audio_window_and_removes_its_artifacts(tmp_path: Path) -> None:
@@ -170,10 +195,12 @@ def test_isolated_separator_reports_warmup_without_consuming_realtime_deadline(
     tmp_path: Path,
 ) -> None:
     separator = _separator(tmp_path, startup_delay=0.5, outputs=[])
+    source = tmp_path / "capture.wav"
+    source.write_bytes(b"pcm")
     try:
         started = time.perf_counter()
         with pytest.raises(InferenceWarmingUp, match="预热"):
-            separator.separate(tmp_path / "capture.wav")
+            separator.separate(source)
         assert time.perf_counter() - started < 0.15
         assert separator.is_alive is True
         assert separator.wait_until_ready(2.0) is True

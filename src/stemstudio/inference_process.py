@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import multiprocessing
+import os
+import shutil
 import struct
 import time
 import uuid
@@ -120,13 +122,30 @@ def _prepare_persistent_separator(
 def _persistent_separator_worker(connection: Connection, config: dict) -> None:
     separator = None
     try:
+        import torch
+
         from .live import PersistentSeparator
 
+        # Demucs still performs audio preparation and CUDA dispatch from CPU
+        # threads. Letting PyTorch inherit every logical core creates large
+        # desktop-wide spikes without increasing throughput for one live
+        # window. Four intra-op threads leave enough feed bandwidth for CUDA
+        # while keeping the rest of the machine responsive.
+        inference_cpu_threads = max(1, min(4, os.cpu_count() or 1))
+        torch.set_num_threads(inference_cpu_threads)
+        torch.set_num_interop_threads(1)
+        torch.backends.cudnn.benchmark = True
         separator, tuning = _prepare_persistent_separator(
             config,
             separator_factory=PersistentSeparator,
         )
-        connection.send({"kind": "ready", **tuning})
+        connection.send(
+            {
+                "kind": "ready",
+                "inference_cpu_threads": inference_cpu_threads,
+                **tuning,
+            }
+        )
         while True:
             request = connection.recv()
             kind = request.get("kind")
@@ -190,11 +209,14 @@ class IsolatedPersistentSeparator:
             raise ValueError("实时推理模型不能为空。")
         self.model_filename = model_filename
         self.inference_timeout_seconds = float(inference_timeout_seconds)
+        self._work_dir = Path(work_dir).resolve()
+        self._work_dir.mkdir(parents=True, exist_ok=True)
         self._ready = False
         self._closed = False
         self._request_id = 0
         self._model_warmup_seconds: float | None = None
         self._tuning_status: dict[str, object] = {
+            "inference_cpu_threads": None,
             "requested_demucs_shifts": demucs_shifts,
             "effective_demucs_shifts": None,
             "shifts_benchmark_seconds": None,
@@ -307,6 +329,20 @@ class IsolatedPersistentSeparator:
                 return False
 
     def separate(self, source: Path) -> list[Path]:
+        if not source.is_file():
+            raise FileNotFoundError(source)
+        staging_dir = self._work_dir / f".inference-input-{uuid.uuid4().hex}"
+        staging_dir.mkdir(parents=True)
+        staged_source = staging_dir / source.name
+        try:
+            # Retention may prune a published capture while the inference child
+            # is opening it. Keep a private immutable copy for this request.
+            shutil.copyfile(source, staged_source)
+            return self._separate_staged(staged_source)
+        finally:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+
+    def _separate_staged(self, source: Path) -> list[Path]:
         if not self.wait_until_ready(0.0):
             raise InferenceWarmingUp("实时模型仍在后台预热，本窗使用原声保底。")
         if not source.is_file():

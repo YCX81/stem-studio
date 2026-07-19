@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 import threading
@@ -23,6 +22,7 @@ from .live_control import (
     STEM_LABELS,
     active_stem_visibility,
     live_dashboard_html,
+    live_pipeline_snapshot,
     live_ui_defaults,
     read_processes,
     routing_markdown,
@@ -66,13 +66,11 @@ def _gpu_coordinator() -> GpuWorkCoordinator:
 
 
 def _native_live_session_active() -> bool:
-    try:
-        payload = json.loads(
-            (LIVE_DIR / "controller-status.json").read_text(encoding="utf-8-sig")
-        )
-    except (OSError, json.JSONDecodeError):
-        return False
-    return payload.get("state") in {"capturing", "airplay_waiting"}
+    snapshot = live_pipeline_snapshot(LIVE_DIR)
+    return snapshot["controller_online"] and snapshot["controller_state"] in {
+        "capturing",
+        "airplay_waiting",
+    }
 
 
 def _gpu_status_markdown() -> str:
@@ -125,7 +123,7 @@ def run_separation(
 
 def refresh_live_processes():
     choices = read_processes(LIVE_DIR)
-    return gr.Dropdown(choices=choices, value=choices[0][1] if choices else None)
+    return gr.Dropdown(choices=choices, value=0)
 
 
 STEM_ORDER = tuple(STEM_LABELS)
@@ -213,6 +211,58 @@ def refresh_mixer_sliders(
     ) + (status,)
 
 
+def switch_live_profile(
+    profile_name: str,
+    vocals: float,
+    instrumental: float,
+    drums: float,
+    bass: float,
+    guitar: float,
+    piano: float,
+    other: float,
+):
+    """Apply a profile selection to both the mixer UI and an active native host."""
+    slider_outputs = refresh_mixer_sliders(
+        profile_name,
+        vocals,
+        instrumental,
+        drums,
+        bass,
+        guitar,
+        piano,
+        other,
+    )
+    if not _native_live_session_active():
+        return (*slider_outputs, status_markdown(LIVE_DIR))
+
+    restored = live_ui_defaults(LIVE_DIR)
+    live_message = start_live_capture(
+        restored["input_source"],
+        restored["process_id"],
+        profile_name,
+        restored["device_endpoint"],
+        vocals,
+        instrumental,
+        drums,
+        bass,
+        guitar,
+        piano,
+        other,
+    )
+    if live_message.startswith("🔴"):
+        return (*slider_outputs[:-1], live_message, live_message)
+
+    track_count = len(LIVE_PROFILES[profile_name].stems)
+    mixer_message = (
+        f"🟡 **{track_count} 轨推子已写入** · 音频链路正在切换"
+    )
+    live_message = (
+        f"🟡 **正在切换至 {profile_name}** · "
+        "音频宿主正在重新缓冲，约 15–20 秒"
+    )
+    return (*slider_outputs[:-1], mixer_message, live_message)
+
+
 def input_source_changed(input_source: str):
     return gr.Dropdown(visible=input_source == "process")
 
@@ -232,7 +282,15 @@ def restore_live_controls():
     gains = restored["gains"]
     visibility = active_stem_visibility(profile_name)
     process_choices = read_processes(LIVE_DIR) if input_source == "process" else []
-    process_value = process_choices[0][1] if process_choices else None
+    available_process_ids = {choice[1] for choice in process_choices}
+    restored_process_id = restored.get("process_id")
+    process_value = (
+        restored_process_id
+        if restored_process_id in available_process_ids
+        else process_choices[0][1]
+        if process_choices
+        else None
+    )
     return (
         gr.Radio(value=input_source),
         gr.Dropdown(
@@ -361,7 +419,7 @@ def build_app() -> gr.Blocks:
         with gr.Tabs():
             with gr.Tab("实时分离"):
                 gr.Markdown(
-                    "可捕获所选 Windows 音乐软件，也可由内置 UxPlay 1.74 宿主接收手机 AirPlay，解码 PCM 后直接分离。"
+                    "可捕获全部 Windows 音频（推荐）或单个进程，也可由内置 UxPlay 1.74 宿主接收手机 AirPlay，解码 PCM 后直接分离。"
                     f"支持二轨、四轨或六轨实时输出模式；采用 12 秒分析窗、{config.live_hop_seconds} 秒步进和 100ms 同时间轴交叉拼接。"
                 )
                 input_source = gr.Radio(
@@ -374,8 +432,9 @@ def build_app() -> gr.Blocks:
                 )
                 with gr.Row():
                     live_process = gr.Dropdown(
-                        label="正在运行的音乐软件",
-                        choices=[],
+                        label="Windows 音频捕获范围",
+                        choices=[("全部 Windows 音频（推荐）", 0)],
+                        value=0,
                         visible=initial_source == "process",
                     )
                     refresh_processes = gr.Button("刷新软件列表")
@@ -441,10 +500,10 @@ def build_app() -> gr.Blocks:
                 input_source.change(input_source_changed, inputs=input_source, outputs=live_process)
                 mixer_inputs = [live_profile, *mixer_sliders]
                 mixer_outputs = [*mixer_sliders, mixer_status]
-                live_profile.change(
-                    refresh_mixer_sliders,
+                live_profile.input(
+                    switch_live_profile,
                     inputs=mixer_inputs,
-                    outputs=mixer_outputs,
+                    outputs=[*mixer_outputs, live_status],
                     queue=False,
                 )
                 app.load(

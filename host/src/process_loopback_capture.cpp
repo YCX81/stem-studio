@@ -1,8 +1,12 @@
 #include "process_loopback_capture.h"
 
+#include "audio_session_mute.h"
+
 #include <audioclientactivationparams.h>
 #include <propvarutil.h>
 
+#include <algorithm>
+#include <cmath>
 #include <stdexcept>
 #include <vector>
 
@@ -22,14 +26,19 @@ ProcessLoopbackCapture::~ProcessLoopbackCapture() {
     if (activation_event_ != nullptr) CloseHandle(activation_event_);
 }
 
-HRESULT ProcessLoopbackCapture::start(const std::uint32_t process_id, AudioCallback callback) {
+HRESULT ProcessLoopbackCapture::start(
+    const std::uint32_t process_id,
+    AudioCallback callback,
+    const bool exclude_process_tree) {
     if (process_id == 0 || !callback) return E_INVALIDARG;
     callback_ = std::move(callback);
 
     AUDIOCLIENT_ACTIVATION_PARAMS params{};
     params.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
     params.ProcessLoopbackParams.TargetProcessId = process_id;
-    params.ProcessLoopbackParams.ProcessLoopbackMode = PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE;
+    params.ProcessLoopbackParams.ProcessLoopbackMode = exclude_process_tree
+        ? PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE
+        : PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE;
     PROPVARIANT variant{};
     variant.vt = VT_BLOB;
     variant.blob.cbSize = sizeof(params);
@@ -45,10 +54,10 @@ HRESULT ProcessLoopbackCapture::start(const std::uint32_t process_id, AudioCallb
     if (WaitForSingleObject(activation_event_, 15'000) != WAIT_OBJECT_0) return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
     if (FAILED(activation_result_)) return activation_result_;
 
-    format_.wFormatTag = WAVE_FORMAT_PCM;
+    format_.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
     format_.nChannels = 2;
     format_.nSamplesPerSec = 44'100;
-    format_.wBitsPerSample = 16;
+    format_.wBitsPerSample = 32;
     format_.nBlockAlign = format_.nChannels * format_.wBitsPerSample / 8;
     format_.nAvgBytesPerSec = format_.nSamplesPerSec * format_.nBlockAlign;
     hr = audio_client_->Initialize(
@@ -97,12 +106,20 @@ void ProcessLoopbackCapture::drain_packets() {
         UINT64 device_position = 0;
         UINT64 qpc_position = 0;
         if (FAILED(capture_client_->GetBuffer(&data, &frames, &flags, &device_position, &qpc_position))) return;
-        const auto byte_count = static_cast<std::size_t>(frames) * format_.nBlockAlign;
+        const auto output_sample_count = static_cast<std::size_t>(frames) * 2;
+        std::vector<std::int16_t> pcm16(output_sample_count);
         if ((flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0) {
-            const std::vector<std::byte> silence(byte_count);
-            callback_(silence);
+            callback_(std::as_bytes(std::span{pcm16}));
         } else {
-            callback_(std::span<const std::byte>(reinterpret_cast<const std::byte*>(data), byte_count));
+            const auto* input = reinterpret_cast<const float*>(data);
+            for (std::size_t index = 0; index < output_sample_count; ++index) {
+                const auto restored = std::clamp(
+                    input[index] * audio_session_isolation_compensation,
+                    -1.0F,
+                    1.0F);
+                pcm16[index] = static_cast<std::int16_t>(std::lrintf(restored * 32'767.0F));
+            }
+            callback_(std::as_bytes(std::span{pcm16}));
         }
         capture_client_->ReleaseBuffer(frames);
     }

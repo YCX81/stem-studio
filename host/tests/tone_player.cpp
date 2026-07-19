@@ -25,13 +25,19 @@ int wmain(const int argc, wchar_t* argv[]) {
     format.nAvgBytesPerSec = sample_rate * format.nBlockAlign;
     HWAVEOUT device = nullptr;
     if (waveOutOpen(&device, WAVE_MAPPER, &format, 0, 0, CALLBACK_NULL) != MMSYSERR_NOERROR) return 1;
-    if (argc == 2 && std::wstring_view(argv[1]) == L"--muted") {
-        waveOutSetVolume(device, 0);
+    bool muted = false;
+    bool delayed = false;
+    for (int index = 1; index < argc; ++index) {
+        const std::wstring_view argument{argv[index]};
+        if (argument == L"--muted") muted = true;
+        if (argument == L"--delayed") delayed = true;
     }
+    waveOutSetVolume(device, muted ? 0 : 0xFFFFFFFFUL);
     WAVEHDR header{};
     header.lpData = reinterpret_cast<LPSTR>(samples.data());
     header.dwBufferLength = static_cast<DWORD>(samples.size() * sizeof(std::int16_t));
     if (waveOutPrepareHeader(device, &header, sizeof(header)) != MMSYSERR_NOERROR) return 2;
+    if (delayed) Sleep(1'000);
     if (waveOutWrite(device, &header, sizeof(header)) != MMSYSERR_NOERROR) return 3;
     while ((header.dwFlags & WHDR_DONE) == 0) Sleep(50);
     waveOutUnprepareHeader(device, &header, sizeof(header));

@@ -32,10 +32,22 @@ function Write-AtomicJson([string]$Path, $Value) {
     Move-Item -LiteralPath $partial -Destination $Path -Force
 }
 
+function Stop-AudioHostProcess($Process) {
+    if ($null -eq $Process -or $Process.HasExited) { return }
+    try {
+        $eventName = "Local\StemStudioAudioHostStop-$($Process.Id)"
+        $stopEvent = [System.Threading.EventWaitHandle]::OpenExisting($eventName)
+        try { $stopEvent.Set() | Out-Null } finally { $stopEvent.Dispose() }
+    } catch { }
+    if (-not $Process.WaitForExit(5000)) {
+        Stop-Process -Id $Process.Id -Force
+        $Process.WaitForExit(3000) | Out-Null
+    }
+}
+
 function Stop-Playback {
     if ($null -ne $script:captureProcess -and -not $script:captureProcess.HasExited) {
-        Stop-Process -Id $script:captureProcess.Id -Force
-        $script:captureProcess.WaitForExit(3000) | Out-Null
+        Stop-AudioHostProcess $script:captureProcess
     }
     $script:captureProcess = $null
     $script:playbackPriority = $null
@@ -192,7 +204,13 @@ try {
                         $airplayStderr = Join-Path $live 'airplay-stderr.log'
                         if ($startPlan.RestartAirPlay) {
                             $activeLanInterface = Get-AirPlayLanInterface
-                            $airplayArgs = @('-n', 'StemStudio', '-nh', '-vs', '0', '-stem-live-dir', 'data/live')
+                            $airplayArgs = @(
+                                '-n', 'StemStudio',
+                                '-nh',
+                                '-vs', '0',
+                                '-stem-live-dir', 'data/live',
+                                '-stem-hop-seconds', [string]$hopSeconds
+                            )
                             if ($null -ne $activeLanInterface) {
                                 $env:STEM_STUDIO_MDNS_IPV4 = $activeLanInterface.IPv4
                                 if ($activeLanInterface.Mac) { $airplayArgs += @('-m', $activeLanInterface.Mac) }
@@ -210,7 +228,15 @@ try {
                         Write-AtomicJson (Join-Path $live 'controller-status.json') ([ordered]@{ state='airplay_waiting'; input_source='airplay'; monitor_stem='mix'; profile_name=$profileName; track_count=$trackCount; hop_seconds=$hopSeconds; device_endpoint=$(if ($deviceEndpoint) { $deviceEndpoint } else { $null }); host_pid=$captureProcess.Id; airplay_pid=$airplayProcess.Id; playback_priority=$playbackPriority; airplay_priority=$airplayPriority; lan_interface=$(if ($null -ne $activeLanInterface) { $activeLanInterface.Name } else { $null }); lan_ipv4=$(if ($null -ne $activeLanInterface) { $activeLanInterface.IPv4 } else { $null }); connection_reused=(-not $startPlan.RestartAirPlay) })
                     } elseif ($command.action -eq 'start') {
                         Stop-Capture
-                        $target = Get-Process -Id ([int]$command.process_id) -ErrorAction Stop
+                        $requestedProcessId = [int]$command.process_id
+                        if ($requestedProcessId -eq 0) {
+                            $captureSource = '--system-loopback'
+                            $targetProcessName = 'WindowsSystemAudio'
+                        } else {
+                            $target = Get-Process -Id $requestedProcessId -ErrorAction Stop
+                            $captureSource = [string]$target.Id
+                            $targetProcessName = $target.ProcessName
+                        }
                         $stdout = Join-Path $live 'capture-stdout.log'
                         $stderr = Join-Path $live 'capture-stderr.log'
                         $profileName = [string]$command.profile_name
@@ -223,13 +249,13 @@ try {
                         if ($null -ne $command.PSObject.Properties['hop_seconds']) {
                             $hopSeconds = Assert-LiveHopSeconds ([int]$command.hop_seconds)
                         }
-                        $captureArgs = @(New-AudioHostArgumentList -Source ([string]$target.Id) -LiveDirectory 'data\live' -TrackCount $trackCount -DeviceEndpoint $deviceEndpoint -HopSeconds $hopSeconds)
+                        $captureArgs = @(New-AudioHostArgumentList -Source $captureSource -LiveDirectory 'data\live' -TrackCount $trackCount -DeviceEndpoint $deviceEndpoint -HopSeconds $hopSeconds)
                         $captureProcess = Start-Process -FilePath $hostExe -ArgumentList $captureArgs -WorkingDirectory $rootPath -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
                         $playbackPriority = Set-StreamingProcessPriority $captureProcess
                         $activeProfileName = $profileName
                         $activeDeviceEndpoint = $deviceEndpoint
                         $activeHopSeconds = $hopSeconds
-                        Write-AtomicJson (Join-Path $live 'controller-status.json') ([ordered]@{ state='capturing'; process_id=$target.Id; process_name=$target.ProcessName; monitor_stem='mix'; profile_name=$profileName; track_count=$trackCount; hop_seconds=$hopSeconds; device_endpoint=$(if ($deviceEndpoint) { $deviceEndpoint } else { $null }); host_pid=$captureProcess.Id; playback_priority=$playbackPriority })
+                        Write-AtomicJson (Join-Path $live 'controller-status.json') ([ordered]@{ state='capturing'; process_id=$requestedProcessId; process_name=$targetProcessName; input_scope=$(if ($requestedProcessId -eq 0) { 'system' } else { 'process' }); monitor_stem='mix'; profile_name=$profileName; track_count=$trackCount; hop_seconds=$hopSeconds; device_endpoint=$(if ($deviceEndpoint) { $deviceEndpoint } else { $null }); host_pid=$captureProcess.Id; playback_priority=$playbackPriority })
                     } elseif ($command.action -eq 'stop') {
                         Stop-Capture
                         Write-AtomicJson (Join-Path $live 'controller-status.json') ([ordered]@{ state='stopped' })

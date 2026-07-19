@@ -30,12 +30,13 @@ target_compile_definitions(stem_host_core PRIVATE UNICODE _UNICODE NOMINMAX WIN3
 target_compile_options(stem_host_core PRIVATE /W4 /permissive- /EHsc)
 
 add_executable(stem-studio-audio-host
+    src/audio_session_mute.cpp
     src/device_udp_sender.cpp
     src/main.cpp
     src/process_loopback_capture.cpp
     src/wasapi_stem_renderer.cpp
 )
-target_link_libraries(stem-studio-audio-host PRIVATE stem_host_core mmdevapi ole32 avrt winmm ws2_32)
+target_link_libraries(stem-studio-audio-host PRIVATE stem_host_core mmdevapi ole32 runtimeobject avrt winmm ws2_32)
 target_compile_definitions(stem-studio-audio-host PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_compile_options(stem-studio-audio-host PRIVATE /W4 /permissive- /EHsc)
 

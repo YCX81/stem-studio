@@ -214,6 +214,7 @@ def test_persistent_separator_configures_requested_demucs_shifts_for_live(
 
     assert captured["demucs_params"]["shifts"] == shifts
     assert captured["demucs_params"]["overlap"] == 0.25
+    assert captured["use_soundfile"] is True
 
 
 def test_persistent_separator_rejects_unsupported_live_shifts(tmp_path: Path) -> None:
@@ -368,6 +369,44 @@ def test_live_chunk_processor_publishes_all_six_requested_stems(tmp_path: Path) 
     manifest = json.loads(result.manifest.read_text(encoding="utf-8"))
     assert tuple(manifest["stems"]) == expected
     assert all((tmp_path / "out" / filename).is_file() for filename in manifest["stems"].values())
+
+
+def test_live_chunk_processor_materializes_returned_near_silent_sources(
+    tmp_path: Path,
+) -> None:
+    profile = LIVE_PROFILES["人声 / 伴奏 · 高质量"]
+    config = LiveConfig(sample_rate=10, window_seconds=8, hop_seconds=2, stable_offset_seconds=3)
+    source = tmp_path / "capture-00000001.wav"
+    _write_pcm16_stereo(source, config.window_frames, config.sample_rate)
+
+    class NearSilentSixStemEngine:
+        def separate(self, _source: Path) -> list[Path]:
+            outputs = []
+            for stem in ("vocals", "drums", "bass", "guitar", "piano", "other"):
+                path = tmp_path / f"track_({stem.title()}).wav"
+                if stem in {"drums", "other"}:
+                    _write_constant_pcm16_stereo(
+                        path,
+                        config.window_frames,
+                        1_000,
+                        config.sample_rate,
+                    )
+                outputs.append(path)
+            return outputs
+
+    result = LiveChunkProcessor(
+        config,
+        tmp_path / "out",
+        NearSilentSixStemEngine(),
+        expected_stems=profile.stems,
+        stem_sources=dict(zip(profile.stems, profile.source_groups, strict=True)),
+    ).process(discover_ready_chunks(tmp_path)[0])
+
+    manifest = json.loads(result.manifest.read_text(encoding="utf-8"))
+    vocals = tmp_path / "out" / manifest["stems"]["vocals"]
+    instrumental = tmp_path / "out" / manifest["stems"]["instrumental"]
+    assert _first_pcm16_sample(vocals) == 0
+    assert _first_pcm16_sample(instrumental) == 2_000
 
 
 @pytest.mark.parametrize(

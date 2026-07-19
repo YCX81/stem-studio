@@ -36,6 +36,7 @@
 #include <math.h>
 #include <inttypes.h>
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -123,6 +124,7 @@ static std::string audiosink = "autoaudiosink";
 static int  audiodelay = -1;
 static bool use_audio = true;
 static std::string stem_live_dir;
+static std::uint32_t stem_hop_seconds = 6;
 static std::unique_ptr<stemstudio::PcmWindowPublisher> stem_pcm_publisher;
 static stemstudio::AirPlayTrackState stem_track_state;
 static std::chrono::steady_clock::time_point stem_last_status_write{};
@@ -1052,6 +1054,7 @@ static void print_info (char *name) {
     printf("-n name   Specify network name of the AirPlay server (UTF-8/ascii)\n");
     printf("-nh       Do not add \"@hostname\" at the end of AirPlay server name\n");
     printf("-stem-live-dir path  Write decoded PCM16 directly to Stem Studio live windows\n");
+    printf("-stem-hop-seconds n  Set Stem Studio live hop to 3 or 6 seconds (default 6)\n");
     printf("-h265     Support h265 (4K) video (with h265 versions of h264 plugins)\n");
     printf("-mp4 [fn] Record (non-HLS)audio/video to mp4 file \"fn.[n].[format].mp4\"\n");
     printf("          n=1,2,.. format = H264/5, ALAC/AAC. Default fn=\"recording\"\n");
@@ -1385,6 +1388,15 @@ static void parse_arguments (int argc, char *argv[]) {
         } else if (arg == "-stem-live-dir") {
             if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
             stem_live_dir = argv[++i];
+        } else if (arg == "-stem-hop-seconds") {
+            if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
+            char *end = NULL;
+            const unsigned long value = strtoul(argv[++i], &end, 10);
+            if (*end != '\0' || (value != 3 && value != 6)) {
+                fprintf(stderr, "-stem-hop-seconds must be 3 or 6\n");
+                exit(1);
+            }
+            stem_hop_seconds = static_cast<std::uint32_t>(value);
         } else if (arg == "-nh") {
             do_append_hostname = false;
         } else if (arg == "-async") {
@@ -3318,9 +3330,11 @@ int main (int argc, char *argv[]) {
     logger_set_level(render_logger, log_level);
 
     if (!stem_live_dir.empty()) {
+        stemstudio::AudioGeometry stem_geometry{};
+        stem_geometry.hop_seconds = stem_hop_seconds;
         stem_pcm_publisher = std::make_unique<stemstudio::PcmWindowPublisher>(
             stem_live_dir,
-            stemstudio::AudioGeometry{},
+            stem_geometry,
             0,
             stem_capture_annotation);
         audio_renderer_set_pcm_callback(stem_pcm_process, NULL);

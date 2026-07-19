@@ -67,6 +67,9 @@ Assert-Equal '--hop-seconds' $playbackArgs[4] 'LAN playback hop flag'
 Assert-Equal 3 $playbackArgs[5] 'LAN playback hop value'
 $localArgs = @(New-AudioHostArgumentList -Source '1234' -LiveDirectory 'data\live' -TrackCount 2)
 Assert-Equal 5 $localArgs.Count 'Local playback must omit endpoint and retain default hop'
+$systemArgs = @(New-AudioHostArgumentList -Source '--system-loopback' -LiveDirectory 'data\live' -TrackCount 2 -HopSeconds 3)
+Assert-Equal '--system-loopback' $systemArgs[0] 'System loopback source argument'
+Assert-Equal 3 $systemArgs[4] 'System loopback hop value'
 Assert-Equal 'AboveNormal' (Get-StreamingPriorityClass) `
     'Native streaming hosts must outrank ordinary desktop build work'
 

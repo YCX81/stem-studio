@@ -94,6 +94,8 @@ class _ResidentDemucsRuntime:
     """Run Demucs repeatedly without moving weights on/off CUDA per window."""
 
     def __init__(self, architecture: Any) -> None:
+        import torch
+
         from audio_separator.separator.architectures.demucs_separator import (
             DEMUCS_2_SOURCE_MAPPER,
             DEMUCS_4_SOURCE_MAPPER,
@@ -101,6 +103,7 @@ class _ResidentDemucsRuntime:
             demucs_segments,
             get_demucs_model,
         )
+        from audio_separator.separator.uvr_lib_v5.demucs.apply import apply_model
 
         self._architecture = architecture
         self._source_maps = {
@@ -113,15 +116,50 @@ class _ResidentDemucsRuntime:
         model = demucs_segments(architecture.segment_size, model)
         model.to(architecture.torch_device)
         model.eval()
+        self._torch = torch
+        self._device = torch.device(architecture.torch_device)
+        self._apply_model = apply_model
         self._model = model
         architecture.demucs_model_instance = model
+
+    def _demix_on_model_device(self, mix: Any) -> Any:
+        """Keep Demucs split accumulation on CUDA instead of round-tripping per segment."""
+        torch = self._torch
+        architecture = self._architecture
+        mix_tensor = torch.as_tensor(
+            mix,
+            dtype=torch.float32,
+            device=self._device,
+        )
+        reference = mix_tensor.mean(0)
+        reference_mean = reference.mean()
+        reference_std = reference.std()
+        normalized = (mix_tensor - reference_mean) / reference_std
+        with torch.inference_mode():
+            sources = self._apply_model(
+                model=self._model,
+                mix=normalized[None],
+                shifts=architecture.shifts,
+                split=architecture.segments_enabled,
+                overlap=architecture.overlap,
+                static_shifts=(
+                    1 if architecture.shifts == 0 else architecture.shifts
+                ),
+                set_progress_bar=None,
+                device=self._device,
+                progress=False,
+            )[0]
+            sources = sources * reference_std + reference_mean
+        separated = sources.float().cpu().numpy()
+        separated[[0, 1]] = separated[[1, 0]]
+        return separated
 
     def separate(self, source: Path) -> list[Path]:
         architecture = self._architecture
         architecture.audio_file_path = str(source)
         architecture.audio_file_base = source.stem
         mix = architecture.prepare_mix(str(source))
-        separated = architecture.demix_demucs(mix)
+        separated = self._demix_on_model_device(mix)
         try:
             source_map = self._source_maps[len(separated)]
         except KeyError as error:
@@ -132,10 +170,13 @@ class _ResidentDemucsRuntime:
         outputs: list[Path] = []
         for stem_name, stem_index in source_map.items():
             stem_path = Path(architecture.get_stem_output_path(stem_name, None))
-            architecture.final_process(
+            # The generic final_process path invokes librosa plus a separate
+            # ffmpeg process for every WAV. Real-time output is fixed PCM16, so
+            # write it directly with libsndfile while preserving the pinned
+            # audio-separator normalization behavior.
+            architecture.write_audio_soundfile(
                 str(stem_path),
                 separated[stem_index].T,
-                stem_name,
             )
             outputs.append(stem_path)
         return outputs
@@ -174,6 +215,7 @@ class PersistentSeparator:
             model_file_dir=str(self.model_dir),
             output_dir=str(self.work_dir),
             output_format="WAV",
+            use_soundfile=True,
             use_autocast=True,
             mdxc_params={
                 "segment_size": 256,
@@ -299,7 +341,10 @@ class LiveChunkProcessor:
         os.replace(partial, manifest)
         return ProcessedChunk(chunk.sequence, manifest, latency)
 
-    def _identify_stems(self, outputs: list[Path]) -> dict[str, tuple[Path, ...]]:
+    def _identify_stems(
+        self,
+        outputs: list[Path],
+    ) -> dict[str, tuple[Path | None, ...]]:
         candidates: dict[str, Path] = {}
         for path in outputs:
             name = path.stem.casefold()
@@ -323,20 +368,36 @@ class LiveChunkProcessor:
             }:
                 raise RuntimeError("实时分离必须同时产生人声和伴奏两个音轨。")
             raise RuntimeError(f"实时分离缺少模型源音轨：{', '.join(missing)}")
-        missing_files = [stem for stem in required_sources if not candidates[stem].is_file()]
-        if missing_files:
-            raise RuntimeError(f"模型输出文件不存在：{', '.join(missing_files)}")
+        # audio-separator intentionally skips writing a WAV when a Demucs source is
+        # near-silent.  The returned path still identifies that source, so preserve
+        # the window and materialize it as silence instead of treating the whole
+        # separation as a failure and restarting the resident GPU model.
         return {
-            stem: tuple(candidates[source] for source in self.stem_sources[stem])
+            stem: tuple(
+                candidates[source] if candidates[source].is_file() else None
+                for source in self.stem_sources[stem]
+            )
             for stem in self.expected_stems
         }
 
-    def _write_overlap_hop(self, sources: tuple[Path, ...], destination: Path) -> None:
+    def _write_overlap_hop(
+        self,
+        sources: tuple[Path | None, ...],
+        destination: Path,
+    ) -> None:
         partial = destination.with_suffix(".wav.part")
         chunks: list[bytes] = []
         params = None
         start_frame = self.config.stable_offset_seconds * self.config.sample_rate
         for source in sources:
+            if source is None:
+                chunks.append(
+                    b"\x00"
+                    * self.config.output_frames
+                    * self.config.channels
+                    * 2
+                )
+                continue
             with wave.open(str(source), "rb") as input_audio:
                 if input_audio.getframerate() != self.config.sample_rate:
                     raise RuntimeError("分离结果采样率与实时会话不一致。")
@@ -350,11 +411,14 @@ class LiveChunkProcessor:
                 chunks.append(input_audio.readframes(self.config.output_frames))
                 if params is None:
                     params = input_audio.getparams()
-        if params is None:
-            raise RuntimeError("实时模型源分组不能为空。")
         frames = chunks[0] if len(chunks) == 1 else self._saturating_sum_pcm16(chunks)
         with wave.open(str(partial), "wb") as output_audio:
-            output_audio.setparams(params)
+            if params is None:
+                output_audio.setnchannels(self.config.channels)
+                output_audio.setsampwidth(2)
+                output_audio.setframerate(self.config.sample_rate)
+            else:
+                output_audio.setparams(params)
             output_audio.writeframes(frames)
         os.replace(partial, destination)
 

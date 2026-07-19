@@ -43,7 +43,21 @@ if ($LASTEXITCODE -ne 0) {
 if (Test-Path -LiteralPath 'data\live\controller-status.json') {
     try {
         $oldStatus = Get-Content -LiteralPath 'data\live\controller-status.json' -Raw | ConvertFrom-Json
-        if ($oldStatus.host_pid) { Stop-Process -Id ([int]$oldStatus.host_pid) -Force -ErrorAction SilentlyContinue }
+        if ($oldStatus.host_pid) {
+            $oldHostId = [int]$oldStatus.host_pid
+            $oldHost = Get-Process -Id $oldHostId -ErrorAction SilentlyContinue
+            if ($null -ne $oldHost) {
+                try {
+                    $stopEvent = [System.Threading.EventWaitHandle]::OpenExisting("Local\StemStudioAudioHostStop-$oldHostId")
+                    try { $stopEvent.Set() | Out-Null } finally { $stopEvent.Dispose() }
+                    if (-not $oldHost.WaitForExit(5000)) {
+                        Stop-Process -Id $oldHostId -Force -ErrorAction SilentlyContinue
+                    }
+                } catch {
+                    Stop-Process -Id $oldHostId -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
         if ($oldStatus.airplay_pid) { Stop-Process -Id ([int]$oldStatus.airplay_pid) -Force -ErrorAction SilentlyContinue }
     } catch { }
 }

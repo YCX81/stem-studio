@@ -129,7 +129,7 @@ class LiveWorker:
         data_root: str | Path,
         separator_factory: Callable[[LiveProfile], PersistentSeparator] | None = None,
         cache_quota_bytes: int = _default_cache_quota_bytes,
-        inference_timeout_seconds: float = 2.8,
+        inference_timeout_seconds: float = 5.5,
         live_hop_seconds: int = 3,
         demucs_shifts: int = 1,
         shifts_benchmark_limit_seconds: float = 2.4,
@@ -257,6 +257,12 @@ class LiveWorker:
             self._session_active = False
             self._reset_song_assembly()
             self._discard_processor()
+            try:
+                # Directory-wide quota scans are slow across the Windows/WSL
+                # bind mount. Run them only after realtime processing stops.
+                self._cache.prune_to_quota(self._cache_quota_bytes // 4)
+            except Exception as exc:
+                self._last_cache_error = str(exc).strip() or type(exc).__name__
             self._last_status_payload.update(
                 {
                     "state": "waiting",
@@ -340,6 +346,10 @@ class LiveWorker:
             fallback_output_gain = gains[fallback_stem]
         except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
             pass
+        # A continuity fallback is not a separated stem. Keep it on one stable
+        # channel instead of moving the full mix to whichever fader is loudest.
+        fallback_stem = preferred_stem
+        fallback_output_gain = 1.0
         source_pcm = self._read_capture_pcm(
             chunk,
             self.config.stable_offset_seconds * self.config.sample_rate,
@@ -449,9 +459,32 @@ class LiveWorker:
         return fallback
 
     def _continuity_reserve_seconds(self) -> float:
-        return max(
-            self._inference_timeout_seconds + 1.0,
-            float(self.config.hop_seconds) + 1.0,
+        # The hard timeout is a crash boundary, not the expected hot-inference
+        # duration. Coupling the reserve to it can make every window fall back
+        # before a healthy model is ever allowed to run.
+        return float(self.config.hop_seconds) + 1.0
+
+    def _windows_capture_status(self) -> dict:
+        try:
+            status = json.loads(
+                (self.root / "capture-input-status.json").read_text(
+                    encoding="utf-8-sig"
+                )
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return status if isinstance(status, dict) else {}
+
+    def _windows_capture_active(self) -> bool:
+        status = self._windows_capture_status()
+        return status.get("state") == "capturing" and status.get("source") == "windows"
+
+    def _windows_capture_is_silent(self) -> bool:
+        status = self._windows_capture_status()
+        return (
+            status.get("state") == "capturing"
+            and status.get("source") == "windows"
+            and status.get("signal_detected") is False
         )
 
     def _continuity_fallback_reason(self, ready_count: int) -> str | None:
@@ -1092,7 +1125,6 @@ class LiveWorker:
                 ]
             self._cache.store_chunk(spec, 0, stem_paths)
             self._cache.finalize(spec, chunk_count=1, metadata=metadata)
-            self._cache.prune_to_quota(self._cache_quota_bytes // 4)
             self._last_cache_error = None
         except Exception as exc:
             # Playback has already been published. Cache maintenance must never
@@ -1123,8 +1155,17 @@ class LiveWorker:
                 result = self._song_cache_hit(chunk, annotation)
                 used_song_cache = result is not None
                 if result is None:
-                    spec = self._cache_spec(chunk)
-                    result = self._cache_hit(chunk, spec)
+                    # A Windows live session creates a new content-addressed
+                    # entry (six WAV copies for the six-track profile) every
+                    # three seconds. Those synchronous bind-mount writes can
+                    # consume the remaining inference headroom and make the
+                    # next otherwise healthy window look backlogged. Windows
+                    # playback has no stable AirPlay timeline to replay, so
+                    # keep its window cache completely off the realtime path.
+                    spec = None
+                    if not self._windows_capture_active():
+                        spec = self._cache_spec(chunk)
+                        result = self._cache_hit(chunk, spec)
                     if result is None:
                         self._cache_misses += 1
                         fallback_reason = self._continuity_fallback_reason(
@@ -1140,9 +1181,15 @@ class LiveWorker:
                                 "可播放缓存已低于 GPU 推理安全余量，立即切换原声保底以避免断音。",
                                 fallback_reason="low_buffer_reserve",
                             )
+                        if self._windows_capture_is_silent():
+                            raise RealtimeBacklogError(
+                                "Windows 音频源当前没有信号，保留已预热模型并输出静音窗口。",
+                                fallback_reason="input_silence",
+                            )
                         self._ensure_processor()
                         result = self._processor.process(chunk)
-                        self._cache_result(chunk, result, spec, annotation)
+                        if spec is not None:
+                            self._cache_result(chunk, result, spec, annotation)
                 if not used_song_cache:
                     self._update_song_assembly(chunk, result, annotation)
             except Exception as exc:
@@ -1171,7 +1218,7 @@ class LiveWorker:
                 )
                 # A separator can retain partial per-file state after an exception.
                 # Recreate it for the next window so one bad output cannot poison the session.
-                if not isinstance(exc, InferenceWarmingUp):
+                if not isinstance(exc, (InferenceWarmingUp, RealtimeBacklogError)):
                     self._discard_processor()
                 self._discard_song_builder()
                 if self._song_stitcher is not None:
@@ -1271,6 +1318,11 @@ class LiveWorker:
                     }
                 )
                 time.sleep(1.0)
+            # A completed hop already consumed most of the three-second
+            # deadline. Check for the next capture immediately; only poll-sleep
+            # when there was no work to process.
+            if results:
+                continue
             stop_event.wait(poll_seconds)
         self._discard_processor()
 
@@ -1367,7 +1419,7 @@ class LiveWorker:
 def start_live_worker(
     data_root: str | Path,
     *,
-    inference_timeout_seconds: float = 2.8,
+    inference_timeout_seconds: float = 5.5,
     live_hop_seconds: int = 3,
     demucs_shifts: int = 1,
     shifts_benchmark_limit_seconds: float = 2.4,

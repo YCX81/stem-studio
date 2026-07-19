@@ -24,7 +24,10 @@ public:
 
     ProcessLoopbackCapture();
     ~ProcessLoopbackCapture() override;
-    HRESULT start(std::uint32_t process_id, AudioCallback callback);
+    HRESULT start(
+        std::uint32_t process_id,
+        AudioCallback callback,
+        bool exclude_process_tree = false);
     void run_until(const std::atomic_bool& stop_requested);
     void stop() noexcept;
 

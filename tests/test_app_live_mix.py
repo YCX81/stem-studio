@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
+import stemstudio.app as app_module
 from stemstudio.live_control import write_mixer_percentages
 
 
@@ -90,3 +93,48 @@ def test_profile_mixer_snapshots_are_isolated_from_other_ui_profiles(
         tmp_path / "mixer-control-2.tsv"
     ).read_text(encoding="utf-8")
     assert not (tmp_path / "mixer-control.tsv").exists()
+
+
+def test_profile_selection_restarts_an_active_native_session(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    (tmp_path / "controller-status.json").write_text(
+        json.dumps(
+            {
+                "state": "capturing",
+                "process_id": 0,
+                "profile_name": "人声 / 伴奏 · 高质量",
+                "track_count": 2,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "controller-heartbeat.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(app_module, "LIVE_DIR", tmp_path)
+    monkeypatch.setattr(
+        app_module,
+        "_hardware_config",
+        lambda: SimpleNamespace(live_hop_seconds=3),
+    )
+    monkeypatch.setattr(app_module, "_LIVE_RESERVATION", object())
+
+    app_module.switch_live_profile(
+        "六轨 · 加吉他/钢琴",
+        100,
+        0,
+        100,
+        100,
+        100,
+        100,
+        100,
+    )
+
+    command = json.loads((tmp_path / "command.json").read_text(encoding="utf-8"))
+    assert command["action"] == "start"
+    assert command["process_id"] == 0
+    assert command["profile_name"] == "六轨 · 加吉他/钢琴"
+    assert command["track_count"] == 6
+    assert command["hop_seconds"] == 3
+    assert (tmp_path / "mixer-control-6.tsv").is_file()

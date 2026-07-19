@@ -69,7 +69,7 @@ def test_detects_selected_gpu_and_balanced_defaults() -> None:
     assert config.gpu_concurrency == 1
     assert config.live_hop_seconds == 3
     assert config.demucs_shifts == 1
-    assert config.inference_timeout_seconds == 2.8
+    assert config.inference_timeout_seconds == 5.5
 
 
 def test_5070_ti_uses_performance_profile_and_validated_overrides() -> None:
@@ -88,7 +88,7 @@ def test_5070_ti_uses_performance_profile_and_validated_overrides() -> None:
     assert config.gpu_concurrency == 2
     assert config.live_hop_seconds == 3
     assert config.demucs_shifts == 2
-    assert config.shifts_benchmark_limit_seconds == 2.4
+    assert config.shifts_benchmark_limit_seconds == 2.0
     assert config.inference_timeout_seconds == 2.7
 
 
@@ -109,7 +109,7 @@ def test_low_vram_profile_reduces_memory_pressure() -> None:
     [
         ({"STEM_STUDIO_GPU_INDEX": "3"}, "GPU 索引"),
         ({"STEM_STUDIO_GPU_CONCURRENCY": "2"}, "15 GB"),
-        ({"STEM_STUDIO_INFERENCE_TIMEOUT_SECONDS": "3"}, "3 秒"),
+        ({"STEM_STUDIO_INFERENCE_TIMEOUT_SECONDS": "11"}, "1.0 到 10.0 秒"),
     ],
 )
 def test_rejects_unsafe_or_invalid_overrides(environ: dict[str, str], message: str) -> None:

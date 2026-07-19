@@ -1,3 +1,5 @@
+#include "audio_level_meter.h"
+#include "audio_session_mute.h"
 #include "audio_window_buffer.h"
 #include "atomic_file.h"
 #include "device_audio_queue.h"
@@ -13,6 +15,9 @@
 
 #include <Windows.h>
 #include <objbase.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Media.Control.h>
+#include <winrt/base.h>
 
 #include <atomic>
 #include <chrono>
@@ -21,6 +26,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <mutex>
 #include <memory>
@@ -113,6 +119,102 @@ int fail_hresult(const char* operation, const HRESULT result) {
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::system_clock::now().time_since_epoch())
             .count());
+}
+
+struct WindowsMediaTrack {
+    std::uint64_t revision{};
+    std::string source;
+    std::string title;
+    std::string artist;
+    std::string album;
+    double position_seconds{};
+    double duration_seconds{};
+    bool playing{};
+};
+
+[[nodiscard]] WindowsMediaTrack read_windows_media_track(
+    const winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager&
+        manager) {
+    WindowsMediaTrack track;
+    const auto session = manager.GetCurrentSession();
+    if (!session) return track;
+
+    const auto media = session.TryGetMediaPropertiesAsync().get();
+    const auto timeline = session.GetTimelineProperties();
+    const auto playback = session.GetPlaybackInfo();
+    track.source = winrt::to_string(session.SourceAppUserModelId());
+    track.title = winrt::to_string(media.Title());
+    track.artist = winrt::to_string(media.Artist());
+    track.album = winrt::to_string(media.AlbumTitle());
+    track.position_seconds = static_cast<double>(timeline.Position().count()) / 10'000'000.0;
+    track.duration_seconds = static_cast<double>(
+                                 (timeline.EndTime() - timeline.StartTime()).count()) /
+                             10'000'000.0;
+    track.playing = playback.PlaybackStatus() ==
+                    winrt::Windows::Media::Control::GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing;
+    const auto identity = track.source + '\n' + track.title + '\n' + track.artist + '\n' +
+                          track.album;
+    track.revision = identity.empty() ? 0 : std::hash<std::string>{}(identity);
+    if (track.revision == 0 && !identity.empty()) track.revision = 1;
+    return track;
+}
+
+void write_capture_input_status(
+    const std::filesystem::path& live_root,
+    const std::string_view state,
+    const bool system_loopback,
+    const std::uint32_t process_id,
+    const std::uint64_t pcm_frames,
+    const stemstudio::AudioLevels& levels,
+    const WindowsMediaTrack& track,
+    const stemstudio::AudioSessionMuteStats mute_stats,
+    const std::string_view media_error = {}) {
+    const auto destination = live_root / L"capture-input-status.json";
+    auto partial = destination;
+    partial += L".part";
+    std::ofstream output(partial, std::ios::trunc);
+    if (!output) throw std::runtime_error("cannot create capture input status file");
+    output << "{\"version\":1"
+           << ",\"state\":\"" << state << '"'
+           << ",\"source\":\"windows\""
+           << ",\"input_scope\":\"" << (system_loopback ? "system" : "process") << '"'
+           << ",\"process_id\":" << (system_loopback ? 0 : process_id)
+           << ",\"sample_rate\":44100"
+           << ",\"channels\":2"
+           << ",\"bits_per_sample\":16"
+           << ",\"pcm_frames\":" << pcm_frames
+           << ",\"peak_left\":" << std::format("{:.6f}", levels.peak_left)
+           << ",\"peak_right\":" << std::format("{:.6f}", levels.peak_right)
+           << ",\"rms_left\":" << std::format("{:.6f}", levels.rms_left)
+           << ",\"rms_right\":" << std::format("{:.6f}", levels.rms_right)
+           << ",\"signal_detected\":"
+           << ((levels.peak_left > 0.0001F || levels.peak_right > 0.0001F) ? "true" : "false")
+           << ",\"source_sessions_tracked\":" << mute_stats.tracked_sessions
+           << ",\"source_sessions_isolated\":" << mute_stats.isolated_sessions
+           << ",\"source_isolation_db\":-40"
+           << ",\"waveform\":[";
+    for (std::size_t index = 0; index < levels.waveform.size(); ++index) {
+        if (index != 0) output << ',';
+        output << std::format("{:.6f}", levels.waveform[index]);
+    }
+    output << "]"
+           << ",\"track\":{"
+           << "\"revision\":" << track.revision
+           << ",\"source\":\"" << json_escape(track.source) << '"'
+           << ",\"title\":\"" << json_escape(track.title) << '"'
+           << ",\"artist\":\"" << json_escape(track.artist) << '"'
+           << ",\"album\":\"" << json_escape(track.album) << '"'
+           << ",\"position_seconds\":" << std::format("{:.3f}", track.position_seconds)
+           << ",\"duration_seconds\":" << std::format("{:.3f}", track.duration_seconds)
+           << ",\"playing\":" << (track.playing ? "true" : "false")
+           << '}';
+    if (!media_error.empty()) {
+        output << ",\"media_error\":\"" << json_escape(media_error) << '"';
+    }
+    output << '}';
+    output.close();
+    if (!output) throw std::runtime_error("failed to finish capture input status file");
+    stemstudio::atomic_replace_file(partial, destination);
 }
 
 void write_playback_status(
@@ -254,15 +356,20 @@ void write_playback_status(
 
 int wmain(const int argc, wchar_t* argv[]) {
     if (argc < 3 || argc > 7) {
-        std::wcerr << L"Usage: stem-studio-audio-host <process-id|--playback-only> "
+        std::wcerr << L"Usage: stem-studio-audio-host <process-id|--system-loopback|--playback-only> "
                       L"<live-data-directory> [2|4|6] [device-ipv4:udp-port] "
                       L"[--hop-seconds 3|6]\n";
         return 2;
     }
 
     const bool playback_only = std::wstring_view(argv[1]) == L"--playback-only";
+    const bool system_loopback = std::wstring_view(argv[1]) == L"--system-loopback";
     unsigned long process_id = 0;
-    if (!playback_only) {
+    if (system_loopback) {
+        // Excluding this process tree captures every other Windows audio session
+        // while keeping Stem Studio's own rendered stems out of the input.
+        process_id = GetCurrentProcessId();
+    } else if (!playback_only) {
         wchar_t* end = nullptr;
         process_id = std::wcstoul(argv[1], &end, 10);
         if (process_id == 0 || *end != L'\0') {
@@ -296,6 +403,21 @@ int wmain(const int argc, wchar_t* argv[]) {
         const ComApartment com{COINIT_MULTITHREADED};
         if (FAILED(com.result())) return fail_hresult("CoInitializeEx", com.result());
         SetConsoleCtrlHandler(handle_console, TRUE);
+        const auto shutdown_event_name = std::format(
+            L"Local\\StemStudioAudioHostStop-{}", GetCurrentProcessId());
+        winrt::handle shutdown_event{
+            CreateEventW(nullptr, TRUE, FALSE, shutdown_event_name.c_str())};
+        std::optional<std::jthread> shutdown_event_thread;
+        if (shutdown_event) {
+            shutdown_event_thread.emplace([event = shutdown_event.get()] {
+                while (!stop_requested.load(std::memory_order_acquire)) {
+                    if (WaitForSingleObject(event, 100) == WAIT_OBJECT_0) {
+                        stop_requested.store(true, std::memory_order_release);
+                        break;
+                    }
+                }
+            });
+        }
 
         auto geometry = stemstudio::AudioGeometry{};
         geometry.hop_seconds = hop_seconds;
@@ -371,6 +493,19 @@ int wmain(const int argc, wchar_t* argv[]) {
 
         std::atomic<std::uint64_t> queued_sequence{0};
         std::atomic<std::uint64_t> skipped_sequence{0};
+        std::atomic<std::uint64_t> captured_pcm_frames{0};
+        std::mutex capture_telemetry_mutex;
+        stemstudio::AudioLevels capture_levels;
+        capture_levels.waveform.assign(32, 0.0F);
+        WindowsMediaTrack windows_media_track;
+        std::string windows_media_error;
+        auto source_mute_guard = playback_only
+                                     ? nullptr
+                                 : std::make_unique<stemstudio::AudioSessionMuteGuard>(
+                                           GetCurrentProcessId(),
+                                           system_loopback
+                                               ? 0
+                                               : static_cast<std::uint32_t>(process_id));
         std::jthread loader_thread([&] {
             try {
                 auto next_sequence = initial_sequence;
@@ -461,6 +596,29 @@ int wmain(const int argc, wchar_t* argv[]) {
         std::jthread status_thread([&] {
             try {
                 while (!stop_requested.load(std::memory_order_acquire)) {
+                    if (!playback_only) {
+                        stemstudio::AudioLevels levels;
+                        WindowsMediaTrack track;
+                        std::string media_error;
+                        {
+                            const std::scoped_lock lock{capture_telemetry_mutex};
+                            levels = capture_levels;
+                            track = windows_media_track;
+                            media_error = windows_media_error;
+                        }
+                        write_capture_input_status(
+                            live_root,
+                            "capturing",
+                            system_loopback,
+                            static_cast<std::uint32_t>(process_id),
+                            captured_pcm_frames.load(std::memory_order_acquire),
+                            levels,
+                            track,
+                            source_mute_guard != nullptr
+                                ? source_mute_guard->stats()
+                                : stemstudio::AudioSessionMuteStats{},
+                            media_error);
+                    }
                     write_playback_status(
                         live_root,
                         stream_buffer,
@@ -506,6 +664,50 @@ int wmain(const int argc, wchar_t* argv[]) {
             }
         });
 
+        std::optional<std::jthread> windows_media_thread;
+        if (!playback_only) {
+            windows_media_thread.emplace([&] {
+                try {
+                    winrt::init_apartment(winrt::apartment_type::multi_threaded);
+                    const auto manager = winrt::Windows::Media::Control::
+                        GlobalSystemMediaTransportControlsSessionManager::RequestAsync().get();
+                    while (!stop_requested.load(std::memory_order_acquire)) {
+                        try {
+                            auto track = read_windows_media_track(manager);
+                            const std::scoped_lock lock{capture_telemetry_mutex};
+                            windows_media_track = std::move(track);
+                            windows_media_error.clear();
+                        } catch (const winrt::hresult_error& error) {
+                            const std::scoped_lock lock{capture_telemetry_mutex};
+                            windows_media_error = winrt::to_string(error.message());
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                    }
+                    winrt::uninit_apartment();
+                } catch (const winrt::hresult_error& error) {
+                    const std::scoped_lock lock{capture_telemetry_mutex};
+                    windows_media_error = winrt::to_string(error.message());
+                }
+            });
+        }
+
+        std::optional<std::jthread> source_mute_thread;
+        if (source_mute_guard != nullptr) {
+            source_mute_thread.emplace([&] {
+                const auto result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+                while (!stop_requested.load(std::memory_order_acquire)) {
+                    try {
+                        source_mute_guard->refresh();
+                    } catch (...) {
+                        // A transient endpoint/session change is retried on the next poll.
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                }
+                source_mute_guard->restore();
+                if (SUCCEEDED(result)) CoUninitialize();
+            });
+        }
+
         if (playback_only) {
             std::wcout << L"Persistent WASAPI multi-stem playback is ready. Press Ctrl+C to stop.\n";
             while (!stop_requested.load(std::memory_order_acquire)) {
@@ -523,13 +725,29 @@ int wmain(const int argc, wchar_t* argv[]) {
             auto capture = Microsoft::WRL::Make<stemstudio::ProcessLoopbackCapture>();
             const auto start_result = capture->start(
                 static_cast<std::uint32_t>(process_id),
-                [&](const std::span<const std::byte> pcm) { windows.append(pcm); });
+                [&](const std::span<const std::byte> pcm) {
+                    auto levels = stemstudio::measure_pcm16_stereo(pcm);
+                    {
+                        const std::scoped_lock lock{capture_telemetry_mutex};
+                        capture_levels = std::move(levels);
+                    }
+                    captured_pcm_frames.fetch_add(
+                        pcm.size() / geometry.bytes_per_frame(),
+                        std::memory_order_release);
+                    windows.append(pcm);
+                },
+                system_loopback);
             if (FAILED(start_result)) {
                 stop_requested.store(true, std::memory_order_release);
                 return fail_hresult("process loopback activation", start_result);
             }
-            std::wcout << L"Capturing process " << process_id
-                       << L" with persistent multi-stem playback. Press Ctrl+C to stop.\n";
+            if (system_loopback) {
+                std::wcout << L"Capturing all Windows audio except Stem Studio playback. "
+                              L"Press Ctrl+C to stop.\n";
+            } else {
+                std::wcout << L"Capturing process " << process_id
+                           << L" with persistent multi-stem playback. Press Ctrl+C to stop.\n";
+            }
             capture->run_until(stop_requested);
         }
 
@@ -541,6 +759,15 @@ int wmain(const int argc, wchar_t* argv[]) {
         }
         control_thread.join();
         status_thread.join();
+        if (windows_media_thread.has_value()) {
+            windows_media_thread->join();
+        }
+        if (source_mute_thread.has_value()) {
+            source_mute_thread->join();
+        }
+        if (shutdown_event_thread.has_value()) {
+            shutdown_event_thread->join();
+        }
         const auto error = read_error();
         if (!error.empty()) {
             std::cerr << error << '\n';

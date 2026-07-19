@@ -38,7 +38,7 @@ Visual Studio C++ 仅在重新编译原生宿主时需要；正常运行和迁�
 
 同一个 Docker 镜像会在启动时读取容器内可见 GPU 的名称、显存和算力，并把最终策略写入 `data/hardware-profile.json`。默认档位为：低于 5.5 GB 仅二轨，5.5–7.5 GB 最高四轨，7.5–12 GB 开放六轨且文件分离片段为 256，12 GB 以上片段为 384；15 GB 以上允许两个文件任务并发。实时推理始终独占 GPU，不会与文件任务并发。
 
-RTX 5060 Ti 8GB 默认使用 12 秒窗、3 秒步进、`shifts=1`。15 GB 以上显存会先尝试 `shifts=2`，在模型完全预热后再实测一次热推理；只有不超过 2.4 秒才保留，否则自动重建为 `shifts=1`。有效 shifts、实测耗时和回退结果会写入 `data/live/gpu-status.json`。
+RTX 5060 Ti 8GB 默认使用 12 秒窗、3 秒步进、`shifts=1`。15 GB 以上显存会先尝试 `shifts=2`，在模型完全预热后再实测一次热推理；只有不超过 2.0 秒才保留，否则自动重建为 `shifts=1`，给缓存写入和调度保留实时余量。有效 shifts、实测耗时和回退结果会写入 `data/live/gpu-status.json`。
 
 `compose.yaml` 默认向容器开放 NVIDIA GPU，并可用环境变量覆盖：`STEM_STUDIO_GPU_DEVICE` 控制 NVIDIA 可见设备，`STEM_STUDIO_GPU_INDEX` 选择容器内索引，`STEM_STUDIO_GPU_CONCURRENCY=1|2|auto` 控制文件任务并发，`STEM_STUDIO_INFERENCE_TIMEOUT_SECONDS=1.0..2.9|auto` 控制 3 秒步进的硬截止。若只向容器暴露一张卡，容器内索引通常仍为 `0`。
 

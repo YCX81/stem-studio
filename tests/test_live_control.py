@@ -74,6 +74,64 @@ def test_live_pipeline_snapshot_exposes_levels_buffer_and_processing_headroom(tm
     assert "持久 WASAPI 输出队列" in dashboard
 
 
+def test_windows_capture_status_drives_levels_and_media_metadata(tmp_path: Path) -> None:
+    (tmp_path / "controller-status.json").write_text(
+        json.dumps(
+            {
+                "state": "capturing",
+                "process_id": 0,
+                "input_scope": "system",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "controller-heartbeat.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "capture-input-status.json").write_text(
+        json.dumps(
+            {
+                "state": "capturing",
+                "source": "windows",
+                "input_scope": "system",
+                "pcm_frames": 88_200,
+                "signal_detected": True,
+                "source_sessions_isolated": 3,
+                "source_isolation_db": -80,
+                "peak_left": 0.8,
+                "peak_right": 0.6,
+                "rms_left": 0.4,
+                "rms_right": 0.3,
+                "waveform": [0.2, 0.5, 0.9],
+                "track": {
+                    "revision": 9,
+                    "title": "Windows Song",
+                    "artist": "Desktop Artist",
+                    "album": "Desktop Album",
+                    "position_seconds": 12.5,
+                    "duration_seconds": 180,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    snapshot = live_pipeline_snapshot(tmp_path)
+
+    assert snapshot["input_source"] == "windows"
+    assert snapshot["input_scope"] == "system"
+    assert snapshot["streaming"] is True
+    assert snapshot["signal_detected"] is True
+    assert snapshot["source_sessions_isolated"] == 3
+    assert snapshot["source_isolation_db"] == -80
+    assert snapshot["received_seconds"] == 2.0
+    assert snapshot["peak_left"] == 0.8
+    assert snapshot["track_title"] == "Windows Song"
+    dashboard = live_dashboard_html(tmp_path)
+    assert "已捕获 Windows 音频" in dashboard
+    assert "Windows Song" in dashboard
+    assert "Desktop Artist" in dashboard
+    assert "Windows WASAPI 系统捕获" in dashboard
+
+
 def test_stale_airplay_stream_is_reported_as_stalled_not_active(
     tmp_path: Path,
 ) -> None:
@@ -541,10 +599,32 @@ def test_live_ui_defaults_follow_active_airplay_profile_and_mixer(tmp_path: Path
     defaults = live_ui_defaults(tmp_path)
 
     assert defaults["input_source"] == "airplay"
+    assert defaults["process_id"] is None
     assert defaults["profile_name"] == "六轨 · 加吉他/钢琴"
     assert defaults["device_endpoint"] == "192.168.31.88:4010"
     assert defaults["gains"]["vocals"] == 0.0
     assert defaults["gains"]["piano"] == 0.8
+
+
+def test_live_ui_defaults_preserve_active_windows_process(tmp_path: Path) -> None:
+    (tmp_path / "controller-status.json").write_text(
+        json.dumps(
+            {
+                "state": "capturing",
+                "process_id": 321,
+                "profile_name": "四轨 · 人声/鼓/贝斯/其他",
+                "track_count": 4,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "controller-heartbeat.json").write_text("{}", encoding="utf-8")
+
+    defaults = live_ui_defaults(tmp_path)
+
+    assert defaults["input_source"] == "process"
+    assert defaults["process_id"] == 321
+    assert defaults["profile_name"] == "四轨 · 人声/鼓/贝斯/其他"
 
 
 def test_live_ui_defaults_reject_stale_active_controller_state(tmp_path: Path) -> None:
@@ -783,6 +863,7 @@ def test_read_processes_builds_stable_pid_choices(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     assert read_processes(tmp_path) == [
+        ("全部 Windows 音频（推荐）", 0),
         ("正在播放 · Music.exe · PID 42", 42),
         ("Utility.exe · Utility.exe · PID 9", 9),
     ]
@@ -806,8 +887,12 @@ def test_write_command_is_atomic_and_validates_pid(tmp_path: Path) -> None:
         "track_count": 6,
     }
     assert not (tmp_path / "command.json.part").exists()
-    with pytest.raises(ValueError, match="音乐软件"):
-        write_command(tmp_path, "start", 0)
+    system_sequence = write_command(tmp_path, "start", 0)
+    system_payload = json.loads((tmp_path / "command.json").read_text(encoding="utf-8"))
+    assert system_payload["sequence"] == system_sequence
+    assert system_payload["process_id"] == 0
+    with pytest.raises(ValueError, match="Windows 音频来源"):
+        write_command(tmp_path, "start", -1)
 
 
 def test_write_command_sequence_is_strictly_increasing_when_clock_repeats(

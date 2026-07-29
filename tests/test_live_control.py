@@ -132,6 +132,37 @@ def test_windows_capture_status_drives_levels_and_media_metadata(tmp_path: Path)
     assert "Windows WASAPI 系统捕获" in dashboard
 
 
+def test_windows_playing_without_process_session_is_not_labeled_as_paused(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "controller-status.json").write_text(
+        json.dumps({"state": "capturing", "process_id": 42}),
+        encoding="utf-8",
+    )
+    (tmp_path / "controller-heartbeat.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "capture-input-status.json").write_text(
+        json.dumps(
+            {
+                "state": "capturing",
+                "source": "windows",
+                "input_scope": "process",
+                "pcm_frames": 44_100,
+                "signal_detected": False,
+                "source_sessions_tracked": 0,
+                "track": {"title": "Protected Song", "playing": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    snapshot = live_pipeline_snapshot(tmp_path)
+    dashboard = live_dashboard_html(tmp_path)
+
+    assert snapshot["track_playing"] is True
+    assert snapshot["source_sessions_tracked"] == 0
+    assert "播放器正在播放，但按进程未捕获到音频" in dashboard
+
+
 def test_stale_airplay_stream_is_reported_as_stalled_not_active(
     tmp_path: Path,
 ) -> None:
@@ -863,9 +894,7 @@ def test_read_processes_builds_stable_pid_choices(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     assert read_processes(tmp_path) == [
-        ("全部 Windows 音频（推荐）", 0),
         ("正在播放 · Music.exe · PID 42", 42),
-        ("Utility.exe · Utility.exe · PID 9", 9),
     ]
 
 
@@ -893,6 +922,26 @@ def test_write_command_is_atomic_and_validates_pid(tmp_path: Path) -> None:
     assert system_payload["process_id"] == 0
     with pytest.raises(ValueError, match="Windows 音频来源"):
         write_command(tmp_path, "start", -1)
+
+
+def test_enable_music_watch_command_does_not_require_a_running_pid(
+    tmp_path: Path,
+) -> None:
+    sequence = write_command(
+        tmp_path,
+        "enable_music_watch",
+        monitor_stem="vocals",
+        profile_name="六轨 · 加吉他/钢琴",
+        hop_seconds=3,
+    )
+
+    payload = json.loads((tmp_path / "command.json").read_text(encoding="utf-8"))
+    assert payload["sequence"] == sequence
+    assert payload["action"] == "enable_music_watch"
+    assert payload["profile_name"] == "六轨 · 加吉他/钢琴"
+    assert payload["track_count"] == 6
+    assert payload["hop_seconds"] == 3
+    assert "process_id" not in payload
 
 
 def test_write_command_sequence_is_strictly_increasing_when_clock_repeats(

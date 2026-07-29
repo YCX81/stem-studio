@@ -403,6 +403,13 @@ def live_pipeline_snapshot(live_root: str | Path) -> dict:
     track_revision = max(0, int(track_number("revision")))
     track_title = track_text("title")
     track_artist = track_text("artist")
+    track_playing = track.get("playing") is True
+    try:
+        source_sessions_tracked = max(
+            0, int(input_status.get("source_sessions_tracked", 0) or 0)
+        )
+    except (TypeError, ValueError):
+        source_sessions_tracked = 0
     lyrics_state = "waiting"
     lyrics_source = ""
     lyrics_instrumental = False
@@ -474,6 +481,8 @@ def live_pipeline_snapshot(live_root: str | Path) -> dict:
         "input_source": "windows" if windows_capture else "airplay",
         "input_scope": str(input_status.get("input_scope", "")),
         "signal_detected": input_status.get("signal_detected") is True,
+        "track_playing": track_playing,
+        "source_sessions_tracked": source_sessions_tracked,
         "source_sessions_isolated": source_sessions_isolated,
         "source_isolation_db": source_isolation_db,
         "airplay_status_age_seconds": (
@@ -643,7 +652,13 @@ def live_dashboard_html(live_root: str | Path) -> str:
         else (
             "已捕获 Windows 音频"
             if snapshot["input_source"] == "windows" and snapshot["signal_detected"]
-            else "Windows 捕获已启动，当前为静音"
+            else "播放器正在播放，但按进程未捕获到音频"
+            if (
+                snapshot["input_source"] == "windows"
+                and snapshot["track_playing"]
+                and snapshot["source_sessions_tracked"] == 0
+            )
+            else "Windows 捕获已启动，等待播放器音频"
             if snapshot["input_source"] == "windows"
             else "正在接收音频"
         )
@@ -1128,10 +1143,25 @@ def write_mixer_percentages(
 
 
 def read_processes(live_root: str | Path) -> list[tuple[str, int]]:
-    system_choice = [("全部 Windows 音频（推荐）", 0)]
     path = Path(live_root) / "processes.json"
     if not path.is_file():
         return []
+    supported_names = {
+        "applemusic",
+        "music",
+        "spotify",
+        "cloudmusic",
+        "qqmusic",
+        "foobar2000",
+        "aimp",
+        "musicbee",
+        "vlc",
+        "potplayermini",
+        "potplayermini64",
+        "itunes",
+        "wmplayer",
+        "microsoft.media.player",
+    }
     try:
         entries = json.loads(path.read_text(encoding="utf-8-sig"))
         candidates = []
@@ -1140,7 +1170,8 @@ def read_processes(live_root: str | Path) -> list[tuple[str, int]]:
             name = str(item["name"]).strip()
             raw_title = item.get("title")
             title = "" if raw_title is None else str(raw_title).strip()
-            if pid > 0 and name:
+            process_name = Path(name).stem.casefold()
+            if pid > 0 and name and process_name in supported_names:
                 candidates.append((name, title, pid))
         grouped: dict[str, tuple[str, str, int]] = {}
         for candidate in candidates:
@@ -1149,20 +1180,16 @@ def read_processes(live_root: str | Path) -> list[tuple[str, int]]:
             current = grouped.get(key)
             if current is None or (bool(title), -pid) > (bool(current[1]), -current[2]):
                 grouped[key] = candidate
-        music_names = ("spotify", "cloudmusic", "qqmusic", "music", "foobar", "aimp", "vlc", "potplayer")
         ordered = sorted(
             grouped.values(),
-            key=lambda item: (
-                0 if any(token in item[0].casefold() for token in music_names) else 1 if item[1] else 2,
-                item[0].casefold(),
-            ),
+            key=lambda item: (0 if item[1] else 1, item[0].casefold()),
         )
-        return system_choice + [
+        return [
             (f"{title or name} · {name} · PID {pid}", pid)
             for name, title, pid in ordered
         ]
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
-        return system_choice
+        return []
 
 
 def write_command(
@@ -1174,11 +1201,17 @@ def write_command(
     device_endpoint: str = "",
     hop_seconds: int | None = None,
 ) -> int:
-    if action not in {"start", "start_airplay", "stop", "open_audio_settings"}:
+    if action not in {
+        "start",
+        "start_airplay",
+        "enable_music_watch",
+        "stop",
+        "open_audio_settings",
+    }:
         raise ValueError("未知实时控制命令。")
     if action == "start" and (process_id is None or int(process_id) < 0):
         raise ValueError("请先选择有效的 Windows 音频来源。")
-    if action in {"start", "start_airplay"}:
+    if action in {"start", "start_airplay", "enable_music_watch"}:
         if hop_seconds is not None and hop_seconds not in {3, 6}:
             raise ValueError("实时步进仅支持 3 秒或 6 秒。")
         if profile_name not in LIVE_PROFILES:
@@ -1191,7 +1224,7 @@ def write_command(
     payload = {"action": action}
     if process_id is not None:
         payload["process_id"] = int(process_id)
-    if action in {"start", "start_airplay"}:
+    if action in {"start", "start_airplay", "enable_music_watch"}:
         payload["monitor_stem"] = monitor_stem
         payload["profile_name"] = profile_name
         payload["track_count"] = len(profile.stems)

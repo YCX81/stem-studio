@@ -137,12 +137,22 @@ def test_live_worker_status_retries_transient_windows_replace_and_skips_unchange
 def test_live_worker_prewarms_profile_from_start_command_before_audio_arrives(tmp_path: Path) -> None:
     loaded_profiles = []
     worker = LiveWorker(tmp_path, separator_factory=lambda profile: loaded_profiles.append(profile))
-    write_command(
+    command_sequence = write_command(
         tmp_path,
         "start",
         42,
         monitor_stem="piano",
         profile_name="六轨 · 加吉他/钢琴",
+    )
+    (tmp_path / "capture-session.json").write_text(
+        json.dumps(
+            {
+                "state": "ready",
+                "command_sequence": command_sequence,
+                "initial_sequence": 1,
+            }
+        ),
+        encoding="utf-8",
     )
 
     worker.process_available()
@@ -330,6 +340,39 @@ def test_live_worker_terminates_timed_out_model_and_keeps_audio_timeline(
     assert worker._deadline_windows == 1
     assert worker._warmup_windows == 0
     assert worker._max_processing_seconds >= manifest["processing_seconds"] - 0.001
+
+
+def test_windows_start_waits_for_matching_capture_session_and_resets_sequence(
+    tmp_path: Path,
+) -> None:
+    worker = LiveWorker(tmp_path, separator_factory=lambda _profile: None)
+    worker._last_sequence = 4503
+    command_sequence = write_command(
+        tmp_path,
+        "start",
+        42,
+        profile_name="人声 / 伴奏 · 高质量",
+        hop_seconds=3,
+    )
+
+    worker._sync_requested_profile()
+    assert worker._session_active is False
+    assert worker._last_sequence == 4503
+
+    (tmp_path / "capture-session.json").write_text(
+        json.dumps(
+            {
+                "state": "ready",
+                "command_sequence": command_sequence,
+                "initial_sequence": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    worker._sync_requested_profile()
+
+    assert worker._session_active is True
+    assert worker._last_sequence == 0
 
 
 def test_live_worker_falls_back_to_original_mix_and_continues_with_next(

@@ -87,6 +87,90 @@ function Get-StreamingPriorityClass {
     return 'AboveNormal'
 }
 
+function Get-SupportedMusicPlayerName {
+    param([Parameter(Mandatory = $true)][string]$ProcessName)
+
+    $candidate = [System.IO.Path]::GetFileNameWithoutExtension($ProcessName).Trim()
+    $supportedPlayers = [ordered]@{
+        'AppleMusic' = 'Apple Music'
+        'Music' = 'Music'
+        'Spotify' = 'Spotify'
+        'cloudmusic' = 'NetEase Cloud Music'
+        'QQMusic' = 'QQ Music'
+        'foobar2000' = 'foobar2000'
+        'AIMP' = 'AIMP'
+        'MusicBee' = 'MusicBee'
+        'vlc' = 'VLC'
+        'PotPlayerMini' = 'PotPlayer'
+        'PotPlayerMini64' = 'PotPlayer'
+        'iTunes' = 'iTunes'
+        'wmplayer' = 'Windows Media Player'
+        'Microsoft.Media.Player' = 'Windows Media Player'
+    }
+    foreach ($entry in $supportedPlayers.GetEnumerator()) {
+        if ($candidate.Equals($entry.Key, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return [pscustomobject]@{
+                ProcessName = $entry.Key
+                DisplayName = $entry.Value
+            }
+        }
+    }
+    return $null
+}
+
+function Select-MusicPlayerProcess {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Processes,
+        [AllowEmptyString()][string]$PreferredProcessName = ''
+    )
+
+    $preferred = [System.IO.Path]::GetFileNameWithoutExtension($PreferredProcessName)
+    return $Processes |
+        Where-Object {
+            $null -ne (Get-SupportedMusicPlayerName ([string]$_.ProcessName))
+        } |
+        Sort-Object `
+            @{ Expression = {
+                $candidate = [System.IO.Path]::GetFileNameWithoutExtension([string]$_.ProcessName)
+                if ($preferred -and $candidate.Equals($preferred, [System.StringComparison]::OrdinalIgnoreCase)) { 0 } else { 1 }
+            } }, `
+            @{ Expression = { if ($_.MainWindowTitle) { 0 } else { 1 } } }, `
+            Id |
+        Select-Object -First 1
+}
+
+function Resolve-MusicCaptureProcess {
+    param(
+        [Parameter(Mandatory = $true)]$PlayerProcess,
+        [Parameter(Mandatory = $true)][object[]]$Processes
+    )
+
+    $playerName = [System.IO.Path]::GetFileNameWithoutExtension(
+        [string]$PlayerProcess.ProcessName
+    )
+    if ($playerName.Equals('AppleMusic', [System.StringComparison]::OrdinalIgnoreCase)) {
+        $appleAudioProcess = $Processes |
+            Where-Object {
+                ([System.IO.Path]::GetFileNameWithoutExtension(
+                    [string]$_.ProcessName
+                )).Equals(
+                    'AMPLibraryAgent',
+                    [System.StringComparison]::OrdinalIgnoreCase
+                ) -and (
+                    $null -eq $PlayerProcess.PSObject.Properties['SessionId'] -or
+                    $null -eq $_.PSObject.Properties['SessionId'] -or
+                    [int]$_.SessionId -eq [int]$PlayerProcess.SessionId
+                )
+            } |
+            Sort-Object Id |
+            Select-Object -First 1
+        if ($null -ne $appleAudioProcess) {
+            return $appleAudioProcess
+        }
+    }
+    return $PlayerProcess
+}
+
 function New-ControllerHeartbeat {
     param(
         [Parameter(Mandatory = $true)][int]$ProcessId,

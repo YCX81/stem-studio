@@ -92,6 +92,36 @@ def test_profile_mixer_snapshots_are_isolated_from_other_ui_profiles(
     assert "instrumental\t0.250000" in (
         tmp_path / "mixer-control-2.tsv"
     ).read_text(encoding="utf-8")
+
+
+def test_page_can_enable_music_monitor_without_selecting_a_process(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(app_module, "LIVE_DIR", tmp_path)
+    monkeypatch.setattr(
+        app_module,
+        "_hardware_config",
+        lambda: SimpleNamespace(live_hop_seconds=3),
+    )
+
+    message = app_module.enable_music_auto_monitor(
+        "六轨 · 加吉他/钢琴",
+        "",
+        100,
+        0,
+        100,
+        100,
+        100,
+        100,
+        100,
+    )
+
+    command = json.loads((tmp_path / "command.json").read_text(encoding="utf-8"))
+    assert command["action"] == "enable_music_watch"
+    assert command["track_count"] == 6
+    assert "process_id" not in command
+    assert "自动监控已启用" in message
     assert not (tmp_path / "mixer-control.tsv").exists()
 
 

@@ -315,6 +315,48 @@ def refresh_live_dashboard() -> tuple[str, str]:
     return status_markdown(LIVE_DIR), live_dashboard_html(LIVE_DIR)
 
 
+def enable_music_auto_monitor(
+    profile_name: str,
+    device_endpoint: str,
+    vocals: float,
+    instrumental: float,
+    drums: float,
+    bass: float,
+    guitar: float,
+    piano: float,
+    other: float,
+) -> str:
+    try:
+        config = _hardware_config()
+        write_mixer_percentages(
+            LIVE_DIR,
+            profile_name,
+            _mixer_percentages(
+                vocals,
+                instrumental,
+                drums,
+                bass,
+                guitar,
+                piano,
+                other,
+            ),
+        )
+        write_command(
+            LIVE_DIR,
+            "enable_music_watch",
+            monitor_stem=LIVE_PROFILES[profile_name].stems[0],
+            profile_name=profile_name,
+            device_endpoint=device_endpoint,
+            hop_seconds=config.live_hop_seconds,
+        )
+        return (
+            "🟡 **音乐软件自动监控已启用** · "
+            "正在等待 Apple Music、Spotify、网易云音乐、QQ 音乐等受支持播放器"
+        )
+    except Exception as exc:
+        return f"🔴 **启用自动监控失败** · {exc}"
+
+
 def start_live_capture(
     input_source: str,
     process_id: int | None,
@@ -484,6 +526,10 @@ def build_app() -> gr.Blocks:
                     start_live = gr.Button("开始实时捕获", variant="primary")
                     stop_live = gr.Button("停止", variant="stop")
                     refresh_status = gr.Button("刷新状态")
+                auto_music = gr.Button(
+                    "启用音乐软件自动监控",
+                    variant="primary",
+                )
                 live_status = gr.Markdown(status_markdown(LIVE_DIR))
                 live_visualizer = gr.HTML(live_dashboard_html(LIVE_DIR))
                 routing_status = gr.Markdown(routing_markdown(LIVE_DIR))
@@ -530,6 +576,15 @@ def build_app() -> gr.Blocks:
                     inputs=[
                         input_source,
                         live_process,
+                        live_profile,
+                        device_endpoint,
+                        *mixer_sliders,
+                    ],
+                    outputs=live_status,
+                )
+                auto_music.click(
+                    enable_music_auto_monitor,
+                    inputs=[
                         live_profile,
                         device_endpoint,
                         *mixer_sliders,

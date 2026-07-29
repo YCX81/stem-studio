@@ -73,6 +73,42 @@ Assert-Equal 3 $systemArgs[4] 'System loopback hop value'
 Assert-Equal 'AboveNormal' (Get-StreamingPriorityClass) `
     'Native streaming hosts must outrank ordinary desktop build work'
 
+$appleMusic = Get-SupportedMusicPlayerName 'AppleMusic.exe'
+Assert-Equal 'AppleMusic' $appleMusic.ProcessName 'Apple Music must be a supported capture target'
+Assert-Equal 'Apple Music' $appleMusic.DisplayName 'Apple Music display name'
+$potPlayer = Get-SupportedMusicPlayerName 'PotPlayerMini64'
+Assert-Equal 'PotPlayer' $potPlayer.DisplayName 'PotPlayer 64-bit must be supported'
+Assert-Equal $null (Get-SupportedMusicPlayerName 'chrome.exe') `
+    'Browsers must not be accepted as music capture targets'
+Assert-Equal $null (Get-SupportedMusicPlayerName 'WindowsSystemAudio') `
+    'System audio must not be accepted as a music capture target'
+$selectedPlayer = Select-MusicPlayerProcess -PreferredProcessName 'Spotify' -Processes @(
+    [pscustomobject]@{ Id = 30; ProcessName = 'Spotify'; MainWindowTitle = '' },
+    [pscustomobject]@{ Id = 20; ProcessName = 'Spotify'; MainWindowTitle = 'Spotify Premium' },
+    [pscustomobject]@{ Id = 10; ProcessName = 'chrome'; MainWindowTitle = 'Music' }
+)
+Assert-Equal 20 $selectedPlayer.Id 'Visible music player process must be preferred'
+$fallbackPlayer = Select-MusicPlayerProcess -PreferredProcessName 'AppleMusic' -Processes @(
+    [pscustomobject]@{ Id = 31; ProcessName = 'chrome'; MainWindowTitle = 'YouTube Music' },
+    [pscustomobject]@{ Id = 22; ProcessName = 'Spotify'; MainWindowTitle = 'Spotify Premium' }
+)
+Assert-Equal 22 $fallbackPlayer.Id 'Any supported music player must be selected when the preferred player is absent'
+$appleCaptureTarget = Resolve-MusicCaptureProcess -PlayerProcess (
+    [pscustomobject]@{ Id = 40; ProcessName = 'AppleMusic'; SessionId = 1 }
+) -Processes @(
+    [pscustomobject]@{ Id = 40; ProcessName = 'AppleMusic'; SessionId = 1 },
+    [pscustomobject]@{ Id = 41; ProcessName = 'AMPLibraryAgent'; SessionId = 2 },
+    [pscustomobject]@{ Id = 42; ProcessName = 'AMPLibraryAgent'; SessionId = 1 }
+)
+Assert-Equal 42 $appleCaptureTarget.Id 'Apple Music capture must bind its audio agent in the same session'
+$spotifyCaptureTarget = Resolve-MusicCaptureProcess -PlayerProcess (
+    [pscustomobject]@{ Id = 50; ProcessName = 'Spotify'; SessionId = 1 }
+) -Processes @(
+    [pscustomobject]@{ Id = 50; ProcessName = 'Spotify'; SessionId = 1 },
+    [pscustomobject]@{ Id = 42; ProcessName = 'AMPLibraryAgent'; SessionId = 1 }
+)
+Assert-Equal 50 $spotifyCaptureTarget.Id 'Other players must capture their own process'
+
 $heartbeat = New-ControllerHeartbeat -ProcessId 1234
 Assert-Equal 1 $heartbeat.version 'Controller heartbeat schema version'
 Assert-Equal 1234 $heartbeat.pid 'Controller heartbeat process id'

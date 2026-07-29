@@ -276,6 +276,24 @@ class LiveWorker:
         if action not in {"start", "start_airplay"}:
             self._profile_command_sequence = sequence
             return
+        if action == "start":
+            session_path = self.root / "capture-session.json"
+            try:
+                session = json.loads(session_path.read_text(encoding="utf-8-sig"))
+                session_ready = (
+                    session.get("state") == "ready"
+                    and int(session.get("command_sequence", 0)) == sequence
+                )
+                initial_sequence = max(1, int(session.get("initial_sequence", 1)))
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                session_ready = False
+                initial_sequence = 1
+            if not session_ready:
+                self._session_active = False
+                return
+            self._last_sequence = initial_sequence - 1
+            self._last_failure = None
+            self._reset_song_assembly()
         profile_name = str(payload.get("profile_name", "人声 / 伴奏 · 高质量"))
         if profile_name not in LIVE_PROFILES:
             raise ValueError("实时控制命令包含未知分离模式。")
